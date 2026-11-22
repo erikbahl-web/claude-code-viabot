@@ -214,9 +214,9 @@ discarding it means driving back to the garage.
 
 **A walk shorter than one uplink cycle measures no uplink at all.** Uplink loss
 is only countable at the far end, so the rig sends a fixed burst
-(`uplink_block_s`, 10 s) and then asks the server what arrived. A burst cut
+(`uplink_block_s`, 20 s) and then asks the server what arrived. A burst cut
 short by the run ending reports nothing, and the burst is followed by
-`uplink_idle_s` (20 s) of silence, so the walk has to outlast the whole cycle.
+`uplink_idle_s` (10 s) of silence, so the walk has to outlast the whole cycle.
 A 23-second test walk therefore has a full downlink trace and no uplink
 whatsoever, and the report used to drop the section rather than say so. It now
 says why. The same applies to the tail of every real walk: up to one burst's
@@ -417,10 +417,24 @@ server; keep it that way, because nothing else catches this class of bug.
 **Enabling `udp_load` moves the headline number.** Dead zones are detected from
 ping, which shares the uplink with the load test. Since 2026-09-18 the loaded
 seconds are excluded rather than judged, so the percentage is an estimate from
-roughly two thirds of the walk rather than all of it. Still a fair sample at a
-steady pace, but not the same measurement. Runs from before and after are not
+part of the walk rather than all of it. Runs from before and after are not
 comparable, and the thresholds were conceived for an idle link. See
 `docs/UNVERIFIED.md`.
+
+**The burst schedule is one trade, and Erik chose which way on 2026-11-22.**
+Every second spent measuring the uplink is a second ping cannot be believed
+about. The schedule went from 10 s on / 20 s off to **20 on / 10 off** because
+the uplink is the robot's video and is the measurement he cares about most:
+uplink is now measured for about 60% of a walk instead of 30%, and dead zones
+are judged from about a quarter of it instead of a half. A dead spot shorter
+than a burst can fall entirely inside one and never be seen by ping. On a
+synthetic walk with one true 25-second dead zone, 10/20 reported it as 19
+seconds and 20/10 as 9. The report's headline caption says how much of the walk
+it was judged from, and stops calling it "a fair sample" below half. Do not
+push past 20/10: the windows get too short for a dead zone to last its five
+seconds inside one. More uplink than that needs the uplink readings themselves
+to count as dead-zone evidence, which is a different detector with a threshold
+nobody has set. Walks from before and after the change are not comparable.
 
 **Pause means "this time did not happen".** It stops measuring and recording
 both, so paused seconds leave no samples and no video. That is what makes the

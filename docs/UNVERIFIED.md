@@ -196,7 +196,8 @@ than the place that caused it. One foil test is not a characterisation.
 **Enabling the load test changes the headline percentage.** Ping shares the
 modem's uplink buffer with it. Since 2026-09-18 the uplink load runs in short
 bursts and those seconds are excluded from detection, so the percentage is
-computed from roughly two thirds of the walk rather than all of it. The duty
+computed from part of the walk rather than all of it: over half at the original
+10 s on / 20 off, about a quarter at the 20 / 10 in use since 2026-11-22. The duty
 cycle is regular and has nothing to do with where you are, so it is an unbiased
 sample, but it is a sample. A short dead spot falling entirely inside a burst
 will be missed. Runs from before and after are not comparable.

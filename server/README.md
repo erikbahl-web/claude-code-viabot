@@ -347,7 +347,7 @@ for name in ('udp_up', 'udp_down'):
           'spent', w['run_mb'], 'MB', 'backfilled', w['backfilled_samples'])"
 ```
 
-Uplink sends in bursts of `uplink_block_s` (10 s) with `uplink_idle_s` (20 s) of
+Uplink sends in bursts of `uplink_block_s` (20 s) with `uplink_idle_s` (10 s) of
 silence between them, and its readings only exist once a burst has finished and
 the server has been asked what arrived. They are then written onto the samples
 they cover, so `backfilled` climbing is what says it is working. Downlink

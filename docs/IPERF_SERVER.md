@@ -43,8 +43,8 @@ udp_load:
   uplink_enabled: true
   uplink_port: 5201
   uplink_bitrate: 3M
-  uplink_block_s: 10
-  uplink_idle_s: 20
+  uplink_block_s: 20     # leave these two out of config.yaml to follow the
+  uplink_idle_s: 10      # repository's schedule when it changes
   uplink_settle_s: 3
 
   downlink_enabled: true
