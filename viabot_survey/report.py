@@ -244,10 +244,44 @@ def _silent_seconds(direction: str, samples: Sequence[dict],
     """
     if direction != "uplink":
         return len(samples) - len(readings)
-    sending = [s for s in samples if s.get("uplink_loaded") == LOAD_SENDING]
-    if not sending:
+    if not any(s.get("uplink_loaded") == LOAD_SENDING for s in samples):
         return len(samples) - len(readings)
-    return sum(1 for s in sending if s.get("udp_up_loss_pct") is None)
+    return sum(1 for sample, sent in zip(samples, uplink_sending(samples))
+               if sent and sample.get("udp_up_loss_pct") is None)
+
+
+def uplink_sending(samples: Sequence[dict]) -> list[bool]:
+    """Which samples were taken during an uplink burst that ran its course.
+
+    A burst the operator cut short is left out. Pause and End stop the test
+    wherever it is, and a burst only reports when it finishes, so one that was
+    interrupted has seconds marked as sending and no readings for them. That
+    is not the link failing: nothing was asked of the server. Counting it put
+    up to a whole burst of "sent, nothing arrived" on every walk that ended
+    mid-burst, which with twenty seconds on and ten off is most of them.
+
+    The same burst lost to the link shortly before a Pause is left out too.
+    The two cannot be told apart from the samples, and under-counting a
+    failure by one burst is the better mistake.
+    """
+    mask = [s.get("uplink_loaded") == LOAD_SENDING for s in samples]
+
+    def paused_after(index: int) -> bool:
+        if index == len(samples) - 1:
+            return True
+        here, after = samples[index].get("ts"), samples[index + 1].get("ts")
+        return here is not None and after is not None and after - here > PAUSE_GAP_S
+
+    for end in range(len(samples)):
+        if not paused_after(end):
+            continue
+        index = end
+        while (index >= 0 and mask[index]
+               and samples[index].get("udp_up_loss_pct") is None
+               and (index == end or not paused_after(index))):
+            mask[index] = False
+            index -= 1
+    return mask
 
 
 def saturation(readings: Sequence[dict], prefix: str, offered_mbps: float | None,
@@ -520,8 +554,7 @@ def throughput_timeline(samples: Sequence[dict], zones: Sequence[dict] = (),
     # Which columns the rig was actually sending uplink in, so silence it chose
     # is never drawn as silence the garage caused.
     out["uplink_sending"] = _bucket(
-        [1.0 if s.get("uplink_loaded") == LOAD_SENDING else None for s in samples],
-        per)
+        [1.0 if sent else None for sent in uplink_sending(samples)], per)
     out["no_stream"] = _no_stream_spans(out, list(series), out["columns"])
     return out
 

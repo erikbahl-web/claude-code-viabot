@@ -700,3 +700,54 @@ def test_a_walk_with_really_nothing_in_it_still_says_so():
     page = report.render_html(dict(REPORT, runnable_pct=None, dead_zones=[],
                                    summary={"dead_zone_count": 0}))
     assert "No samples were recorded" in page
+
+
+# ---- a burst the operator cut short is not the link failing ----------------
+
+def _marked(pattern, start=BASE, step=1.0):
+    """Samples from a string: S sending and unread, R sending with a reading,
+    . idle. A space is a pause: no samples for a while."""
+    rows, ts = [], start
+    for mark in pattern:
+        if mark == " ":
+            ts += 60
+            continue
+        rows.append({"ts": ts, "rtt_ms": 40.0, "loss_pct": 0.0,
+                     "uplink_loaded": 2 if mark in "SR" else 0,
+                     "udp_up_loss_pct": 0.0 if mark == "R" else None,
+                     "udp_up_mbps": 2.9 if mark == "R" else None,
+                     "udp_up_jitter_ms": 3.0 if mark == "R" else None})
+        ts += step
+    return rows
+
+
+def _unread(pattern):
+    samples = _marked(pattern)
+    readings = [s for s in samples if s["udp_up_loss_pct"] is not None]
+    return report._silent_seconds("uplink", samples, readings)
+
+
+def test_a_burst_cut_off_by_end_is_not_counted_as_sent_and_lost():
+    """End stops the test wherever it is, and a burst only reports when it
+    finishes. With twenty seconds on and ten off that is most walks, and each
+    one showed up to a whole burst of "sent, nothing arrived" on the first
+    page, described as the link failing badly enough to take the test down."""
+    assert _unread("RRRR....RRRR....SSS") == 0
+
+
+def test_a_burst_cut_off_by_pause_is_not_counted_either():
+    assert _unread("RRRR....SSS ....RRRR....") == 0
+
+
+def test_a_burst_the_link_lost_is_still_counted():
+    assert _unread("RRRR....SSSS....RRRR....") == 4
+    assert _unread("RRRR....SSSS....RRRR....SS") == 4      # and End cut the last
+
+
+def test_only_the_cut_burst_is_forgiven_not_the_ones_before_it():
+    assert _unread("SSSS....SSSS....SSS") == 8
+
+
+def test_the_plot_does_not_shade_a_cut_burst_as_a_failure():
+    mask = report.uplink_sending(_marked("RRRR....SSSS....SSS"))
+    assert mask == [True] * 4 + [False] * 4 + [True] * 4 + [False] * 4 + [False] * 3

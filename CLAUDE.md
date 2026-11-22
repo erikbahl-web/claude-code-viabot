@@ -115,9 +115,23 @@ Two things separate them, and both have to stay:
   end by itself with "unable to connect". Without it that connect is silent for
   as long as the kernel retries. With it, silence that lasts until the watchdog
   means the connection was *made* and the server never spoke.
-- `SurveyRunner._link_alive` is ping, sampled every second of the silence.
-  Silent with ping answering for 80% of it is the server (`silent`, red, "restart
-  the server"). Silent with ping dead is the place, and stays amber.
+- `SurveyRunner._link_quality` is ping, sampled every second of the attempt,
+  and it gives three answers, not two: good (what the banner calls GOOD or
+  DEGRADED), poor, or dead. Silent with the link **good** for 80% of it is the
+  server (`silent`, red, "restart the server"). Dead is the place. Poor is
+  also the place, and this is the one that is easy to get wrong.
+
+**"Not dead" is not "good", and only good counts against the server.** iperf3
+prints nothing at all until its first interval line, a second into the test,
+so silence means only that the handshake never finished. On a link getting one
+ping in five through, a handshake can spend a quarter of a minute in TCP
+retries and then lose the single datagram that starts the test, and four SYNs
+in ten seconds can all go missing. The first version of this called the link
+"alive" whenever ping loss was under 100% and would have told an operator to
+restart a healthy server in exactly the marginal places a survey is for, then
+quoted that in a report that cannot be corrected. A review caught it before it
+shipped. Anything short of a clean link is amber: "no answer from the server"
+or "link too weak for the test".
 
 Verified 2026-11-22 against a 3.16 server wedged for real, on loopback. The
 rig's own client is 3.18 and was only read as source: that the flag exists there
@@ -125,9 +139,14 @@ and that "Connecting to host" is printed at the same point.
 
 **Load-test trouble only becomes a fault when it lasts** (`ESCALATE_AFTER_S`).
 A dead zone takes the load test down too, and that is the garage's doing, so
-`no_link`, `interrupted` and `no_readings` never go red however long they go
-on. `busy` gets two minutes, because a server legitimately answers "busy" for
-46.6 s after any rig vanishes mid-test. A chip that goes red in every dead zone
+`no_link`, `weak_link`, `interrupted` and `no_readings` never go red however
+long they go on. `busy` gets two minutes, because a server legitimately answers
+"busy" for 46.6 s after any rig vanishes mid-test. `unreachable` gets a minute:
+three failed connects in a row on a clean link. Each kind's clock runs from
+when it was first seen until something *works*, not until the next different
+failure and not until the next Pause. A server stuck on a dead test answers
+"busy" between dead zones for a whole walk, and a clock that restarted at every
+dead zone would never reach two minutes. A chip that goes red in every dead zone
 trains its operator to stop reading it, and then it is worth nothing on the day
 the server really is stuck.
 
@@ -240,7 +259,22 @@ server has set the test up (the "connected to" line), not when iperf3 is
 launched: an attempt that never gets that far puts nothing on the uplink, and
 marking it loaded took its seconds out of dead-zone detection inside dead
 zones, the one place detection is for. It also counted every handshake as a
-second in which the rig "sent and nothing arrived". They are dropped from the
+second in which the rig "sent and nothing arrived".
+
+Three details of that bookkeeping exist because a real link is not loopback:
+
+- iperf3 says nothing until the first interval is over, so the first sample of
+  every burst is written before anything shows the burst has begun. The
+  reading that comes back for it stamps `uplink_loaded` on it afterwards.
+- The last interval line of every burst only arrives once the end-of-test
+  exchange has gone round. Readings are therefore placed from the *earliest*
+  estimate of when the burst began (each line says how far in it ends; lines
+  can be late and never early), not each by its own line's arrival. Timing them
+  individually left one second per burst marked "sent" with nothing on it.
+- A burst cut short by Pause or End has sending marks and no readings, because
+  nothing was ever asked of the server. `report.uplink_sending()` leaves it out
+  of "sent, nothing arrived" and of the grey shading on the plot. With twenty
+  seconds on and ten off, End lands inside a burst most of the time. They are dropped from the
 percentage rather than counted as good, exactly as paused seconds are, and the
 report prints both `walked_s` and `judged_s`. Three things follow that are easy
 to break:

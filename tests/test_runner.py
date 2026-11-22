@@ -370,15 +370,23 @@ def test_a_broken_chip_never_takes_the_phone_down(runner, monkeypatch):
     assert {"camera", "link", "power", "disk", "clock"} <= set(health)
 
 
-def test_ping_is_the_witness_for_whether_the_link_is_up(runner):
-    assert runner._link_alive() is None            # ping is off in this fixture
+def test_ping_is_the_witness_for_how_good_the_link_is(runner):
+    """Three answers, not two. Only a link the banner would call usable is
+    evidence against the server; one that is merely not dead is not."""
+    assert runner._link_quality() is None          # ping is off in this fixture
     runner.ping.enabled = True
-    assert runner._link_alive() is None            # ...and has not reported yet
-    runner._last_sample = {"loss_pct": 100.0}
-    assert runner._link_alive() is False
-    runner._last_sample = {"loss_pct": 40.0}
-    assert runner._link_alive() is True
-    assert runner.udp_up._link_now() is True       # the workers ask the runner
+    assert runner._link_quality() is None          # ...and has not reported yet
+    runner._last_sample = {"loss_pct": 100.0, "status": "bad"}
+    assert runner._link_quality() == "dead"
+    runner._last_sample = {"loss_pct": 60.0, "status": "bad"}
+    assert runner._link_quality() == "poor"
+    runner._last_sample = {"loss_pct": 0.0, "rtt_ms": 900.0, "status": "bad"}
+    assert runner._link_quality() == "poor"
+    runner._last_sample = {"loss_pct": 8.0, "status": "degraded"}
+    assert runner._link_quality() == "good"
+    runner._last_sample = {"loss_pct": 0.0, "status": "good"}
+    assert runner._link_quality() == "good"
+    assert runner.udp_up._link_now() == "good"     # the workers ask the runner
 
 
 def test_a_walk_that_ended_inside_a_burst_is_logged_as_too_short(runner, storage, monkeypatch):

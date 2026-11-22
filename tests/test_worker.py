@@ -72,3 +72,52 @@ def test_finishing_a_block_is_not_announced_as_a_problem():
 
 def test_an_immediate_exit_is_still_announced():
     assert any("restarting" in message for _, message in drive(0.0).events)
+
+
+class SlowToDie(Worker):
+    """A worker whose current job takes a moment to notice it was stopped,
+    the way a subprocess takes a moment to die on a loaded Pi."""
+
+    name = "slow"
+    restart_delay_s = 0.01
+
+    def __init__(self, dying_s: float) -> None:
+        super().__init__()
+        self.dying_s = dying_s
+        self.runs = 0
+
+    def run_once(self) -> None:
+        self.runs += 1
+        self._stop.wait(30)
+        time.sleep(self.dying_s)
+
+
+def test_a_worker_restarted_while_the_old_one_is_still_dying_does_restart():
+    """stop() gives up waiting after a timeout. Starting again used to see the
+    old thread still alive, return without doing anything, and leave the stop
+    flag set, so the old thread then exited and nothing replaced it. A Resume
+    pressed soon after a Pause could leave the camera or the load test off for
+    the rest of the walk, with nothing said."""
+    worker = SlowToDie(dying_s=0.6)
+    worker.start()
+    time.sleep(0.1)
+    worker.stop(timeout=0.05)              # gives up before the thread is gone
+    assert worker._thread.is_alive()
+
+    worker.start()                         # Resume
+    time.sleep(0.2)
+    assert worker._thread.is_alive()
+    assert not worker.stopping
+    assert worker.runs == 2
+    worker.stop()
+
+
+def test_starting_a_worker_that_is_already_running_changes_nothing():
+    worker = SlowToDie(dying_s=0.0)
+    worker.start()
+    time.sleep(0.05)
+    thread = worker._thread
+    worker.start()
+    assert worker._thread is thread
+    assert worker.runs == 1
+    worker.stop()

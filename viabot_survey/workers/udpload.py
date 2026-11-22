@@ -131,17 +131,33 @@ OUTCOME_OK, OUTCOME_WARN, OUTCOME_FAIL = "ok", "warn", "fail"
 #: * ``silent`` and ``auth`` are faults at once. A silent verdict already has
 #:   :data:`STALL_AFTER_S` of evidence behind it, and a login does not fix
 #:   itself.
-#: * ``refused`` and ``unreachable`` get a moment, because a server that is
-#:   being restarted refuses connections for a second or two.
+#: * ``refused`` gets a moment, because a server that is being restarted
+#:   refuses connections for a second or two.
+#: * ``unreachable`` gets a minute, which is three failed connects in a row on
+#:   a link ping calls clean. One can be bad luck.
 #: * ``busy`` gets two minutes. Measured on 3.16, a server answers "busy" for
 #:   46.6 s after a client vanishes mid-test; busy for much longer than that is
 #:   a test nobody is on the other end of.
+#:
+#: The clock for a kind runs from when it was first seen until something
+#: succeeds, not until the next different failure. A server stuck on a dead
+#: test answers "busy" between dead zones for a whole walk, and a clock that
+#: restarted at every dead zone would never reach two minutes.
 ESCALATE_AFTER_S = {"silent": 0.0, "auth": 0.0, "missing": 0.0,
-                    "refused": 20.0, "unreachable": 20.0, "busy": 120.0}
+                    "refused": 20.0, "unreachable": 60.0, "busy": 120.0}
 
-#: Share of the silent seconds ping has to have been answered in before the
-#: silence is blamed on the server rather than on the place, and the fewest
-#: seconds worth judging from.
+#: A kind of trouble not seen for this long is a new episode when it returns.
+TROUBLE_FORGOTTEN_AFTER_S = 300.0
+
+#: What the link witness can say. "Poor" matters as much as the other two: a
+#: link that gets one ping in five through is not dead, and it is not a link
+#: an iperf3 handshake can be expected to finish over either. Blaming the
+#: server needs a link that was *good*, not merely one that was not dead.
+LINK_GOOD, LINK_POOR, LINK_DEAD = "good", "poor", "dead"
+
+#: Share of an attempt's seconds the link has to have been good (or dead) for
+#: before that is taken as what the link was, and the fewest seconds worth
+#: judging from.
 LINK_UP_SHARE = 0.8
 MIN_LINK_SAMPLES = 5
 
@@ -222,13 +238,15 @@ def parse_error(text: str) -> str | None:
     return message
 
 
-def error_kind(message: str | None, link_up: bool | None) -> str:
+def error_kind(message: str | None, link: str | None) -> str:
     """Which kind of trouble an iperf3 failure is.
 
-    The same words mean different things depending on whether the link was up.
-    "Unable to connect" in a dead zone is the dead zone; "unable to connect"
-    while ping is getting through is a server that has gone. ``link_up`` is
-    None when nothing can say, and that is treated as the harmless reading:
+    The same words mean different things depending on the link. "Unable to
+    connect" in a dead zone is the dead zone; on a link that was getting one
+    ping in five through it is a link too weak to finish a handshake; only on
+    a link ping called *good* is it a server that has gone. ``link`` is one of
+    :data:`LINK_GOOD`, :data:`LINK_POOR`, :data:`LINK_DEAD`, or None when
+    nothing can say, and anything short of good is read the harmless way:
     blaming a healthy server costs somebody a restart in the middle of a walk.
     """
     if not message:
@@ -241,7 +259,8 @@ def error_kind(message: str | None, link_up: bool | None) -> str:
     if "connection refused" in text:
         return "refused"
     if "unable to connect" in text:
-        return "unreachable" if link_up else "no_link"
+        return {LINK_GOOD: "unreachable", LINK_DEAD: "no_link",
+                None: "no_connect"}.get(link, "weak_link")
     return "interrupted"
 
 
@@ -270,6 +289,9 @@ def phone_words(kind: str, fault: bool) -> tuple[str, str]:
                  "Check the password, the rig's clock and the iperf3 version."),
         "missing": ("iperf3 is not installed on the rig", ""),
         "no_link": ("no link", ""),
+        "weak_link": ("link too weak for the test", ""),
+        "no_connect": ("cannot connect to the server", ""),
+        "no_data": ("connected, nothing arriving", ""),
         "no_answer": ("no answer from the server", ""),
         "interrupted": ("test cut off", ""),
         "no_readings": ("no readings", ""),
@@ -285,7 +307,12 @@ _PLAIN_WORDS = {
     "no_link": ("could not connect to the server, and ping was not getting "
                 "through either. There is no link here; the server is not the "
                 "problem"),
-    "unreachable": "could not connect to the server although ping was getting through",
+    "weak_link": ("could not connect to the server, and ping was only getting "
+                  "through poorly. The link here is too weak for the test; the "
+                  "server is not the problem"),
+    "no_connect": "could not connect to the server",
+    "unreachable": ("could not connect to the server although ping was getting "
+                    "through cleanly"),
     "refused": "the server refused the connection",
     "interrupted": "the test was cut off",
 }
@@ -433,7 +460,7 @@ class UdpLoadWorker(Worker):
                  run_data_budget_mb: float | None = 2000.0,
                  username: str = "", password: str = "", public_key_path: str = "",
                  on_backfill: Callable[[list[tuple[float, dict]]], None] | None = None,
-                 link_alive: Callable[[], bool | None] | None = None,
+                 link_quality: Callable[[], str | None] | None = None,
                  enabled: bool = True, **kwargs: Any) -> None:
         super().__init__(enabled=enabled and bool(server), **kwargs)
         self.direction = direction
@@ -459,14 +486,20 @@ class UdpLoadWorker(Worker):
         self._last_line: str | None = None
         self._warned_no_address = False
         self._last_reason: tuple[str, bool] | None = None
-        # Whether ping is getting through, asked of whoever owns ping. It is the
-        # only witness to whether a silent server is the server's doing.
-        self._link_alive = link_alive
+        # How ping is doing, asked of whoever owns ping. It is the only
+        # witness to whether a silent server is the server's doing.
+        self._link_quality = link_quality
+        # What that witness said, second by second, during this attempt.
+        self._attempt_link = {LINK_GOOD: 0, LINK_POOR: 0, LINK_DEAD: 0}
         # The last finished attempt, for the phone. Kept between blocks so the
         # chip does not flicker back to "unknown" every thirty seconds.
         self._outcome: dict[str, Any] | None = None
-        # (kind, since): the trouble currently in progress, and when it began.
-        self._trouble: tuple[str, float] | None = None
+        # kind -> (first seen, last seen), for every kind of trouble met since
+        # anything last worked.
+        self._trouble_since: dict[str, tuple[float, float]] = {}
+        # When this worker was last started, so that a direction which never
+        # reports at all does not sit on "first test running" for a whole walk.
+        self._started_at: float | None = None
         # Set by the stall watchdog once it has said why it killed a test, so
         # the reader does not then report the same death as "no readings".
         self._stalled = False
@@ -560,6 +593,7 @@ class UdpLoadWorker(Worker):
         self._last_output_ts = time.time()
         self._stalled = False
         self._engaged = False
+        self._attempt_link = {LINK_GOOD: 0, LINK_POOR: 0, LINK_DEAD: 0}
         self._watch_for_stall(self._proc)
         return self._proc
 
@@ -573,20 +607,19 @@ class UdpLoadWorker(Worker):
         which lets the normal restart path run and put a reason in the event
         log.
         """
+        # How the link was doing for every second this attempt ran. Counted
+        # across the whole attempt rather than read once at the end: a link
+        # that comes back in the last second must not turn 44 seconds of dead
+        # zone into a verdict against the server.
+        tally = self._attempt_link
+
         def watch() -> None:
-            # Whether ping was getting through while the test said nothing.
-            # Counted across the whole silence rather than read once at the
-            # end: a link that comes back in the last second must not turn 44
-            # seconds of dead zone into a verdict against the server.
-            link_up = link_down = 0
             while proc.poll() is None:
                 if self._stop.wait(1.0):
                     return
-                alive = self._link_now()
-                if alive is True:
-                    link_up += 1
-                elif alive is False:
-                    link_down += 1
+                quality = self._link_now()
+                if quality in tally:
+                    tally[quality] += 1
                 if time.time() - self._last_output_ts < STALL_AFTER_S:
                     continue
                 if proc.poll() is not None:
@@ -597,7 +630,7 @@ class UdpLoadWorker(Worker):
                 # Say why before the kill. The reader wakes the moment the
                 # process dies and must find the verdict already given, or it
                 # reports the same death a second time as "no readings".
-                self._note_trouble(*self._stall_verdict(link_up, link_down))
+                self._note_trouble(*self._stall_verdict())
                 self._stalled = True
                 try:
                     proc.kill()
@@ -608,16 +641,32 @@ class UdpLoadWorker(Worker):
         threading.Thread(target=watch, name=f"{self.name}-stall",
                          daemon=True).start()
 
-    def _link_now(self) -> bool | None:
-        """Whether ping is being answered, or None when nothing can say."""
-        if self._link_alive is None:
+    def _link_now(self) -> str | None:
+        """How ping is doing this second, or None when nothing can say."""
+        if self._link_quality is None:
             return None
         try:
-            return self._link_alive()
+            return self._link_quality()
         except Exception:  # noqa: BLE001 - a witness that falls over is just absent
             return None
 
-    def _stall_verdict(self, link_up: int, link_down: int) -> tuple[str, str]:
+    def _link_during_attempt(self) -> str | None:
+        """What the link was for the attempt that has just ended.
+
+        Good or dead only if it was that for nearly all of it; anything mixed
+        is "poor". An attempt too short to have been watched falls back to how
+        the link is at this moment.
+        """
+        tally = self._attempt_link
+        seen = sum(tally.values())
+        if seen < MIN_LINK_SAMPLES:
+            return self._link_now()
+        for quality in (LINK_GOOD, LINK_DEAD):
+            if tally[quality] / seen >= LINK_UP_SHARE:
+                return quality
+        return LINK_POOR
+
+    def _stall_verdict(self) -> tuple[str, str]:
         """Why a test went silent, as (kind of trouble, words for the log).
 
         Three different things look identical from here, and only one of them
@@ -627,12 +676,21 @@ class UdpLoadWorker(Worker):
           a dead zone doing what dead zones do.
         * The server never set the test up, and ping was not getting through
           either: there was no link to set it up over.
-        * The server never set the test up while ping was fine. The connection
-          was made (a connect that cannot complete ends by itself, see
-          :data:`CONNECT_TIMEOUT_MS`) and the server then said nothing. That is
-          a stuck server. On 2026-10-15 it went on for two whole walks, logged
+        * The server never set the test up while ping was *good*. The
+          connection was made (a connect that cannot complete ends by itself,
+          see :data:`CONNECT_TIMEOUT_MS`) and nothing came of it. That is a
+          stuck server. On 2026-10-15 it went on for two whole walks, logged
           once a minute as "stopped responding", and nobody could tell it from
           a bad garage.
+
+        Good, not merely alive. iperf3 prints nothing until its first interval
+        line, a second into the test, so silence means only that the handshake
+        never finished, and on a link getting one ping in five through a
+        handshake can spend a quarter of a minute in TCP retries and then lose
+        the single datagram that starts the test. That is the garage. Calling
+        it a stuck server would tell an operator to restart a healthy one, in
+        exactly the marginal places a survey is for, and would put that in a
+        report that cannot be corrected afterwards.
         """
         side = "uplink" if self.direction == UPLINK else "downlink"
         quiet = f"{STALL_AFTER_S:.0f}s"
@@ -640,20 +698,22 @@ class UdpLoadWorker(Worker):
             return ("interrupted",
                     "the test went quiet part-way through and was restarted "
                     f"after {quiet}; the link most likely dropped")
-        seen = link_up + link_down
-        share = link_up / seen if seen else 0.0
-        if seen >= MIN_LINK_SAMPLES and share >= LINK_UP_SHARE:
+        link = self._link_during_attempt()
+        if link == LINK_GOOD:
             return ("silent",
-                    f"the server took the connection and then said nothing for "
-                    f"{quiet}, while ping was getting through. The server's "
-                    f"{side} test service is stuck: restart the server. There "
-                    f"will be no {side} readings until then")
-        if seen >= MIN_LINK_SAMPLES and share <= 1.0 - LINK_UP_SHARE:
+                    f"the test connected to the server and then heard nothing "
+                    f"back for {quiet}, while ping was getting through cleanly. "
+                    f"The server's {side} test service is stuck: restart the "
+                    f"server. There will be no {side} readings until then")
+        if link == LINK_DEAD:
             return ("no_link",
                     f"no answer from the server for {quiet}, and ping was not "
                     "getting through either. There is no link here; the server "
                     "is not the problem")
-        return ("no_answer", f"no answer from the server for {quiet}")
+        return ("no_answer",
+                f"no answer from the server for {quiet}"
+                + (", on a link ping was only getting through poorly. Most "
+                   "likely the place, not the server" if link == LINK_POOR else ""))
 
     # -- what happened to the last attempt -----------------------------------
 
@@ -665,7 +725,7 @@ class UdpLoadWorker(Worker):
     def _note_ok(self) -> None:
         """Readings arrived: whatever was wrong is over."""
         recovered = bool(self._last_reason and self._last_reason[1])
-        self._trouble = None
+        self._trouble_since.clear()
         self._last_reason = None
         self._outcome = {"state": OUTCOME_OK, "kind": "ok", "detail": "measuring",
                          "advice": "", "ts": time.time()}
@@ -682,10 +742,12 @@ class UdpLoadWorker(Worker):
         would bury the rest of the event log within one walk.
         """
         now = time.time()
-        if self._trouble is None or self._trouble[0] != kind:
-            self._trouble = (kind, now)
+        first, last = self._trouble_since.get(kind, (now, now))
+        if now - last > TROUBLE_FORGOTTEN_AFTER_S:
+            first = now
+        self._trouble_since[kind] = (first, now)
         wait = ESCALATE_AFTER_S.get(kind)
-        fault = wait is not None and now - self._trouble[1] >= wait
+        fault = wait is not None and now - first >= wait
         if fault:
             reason = _FAULT_WORDS.get(kind, reason)
         self._set_state(STATE_FAILED if fault else STATE_DEGRADED, reason)
@@ -702,10 +764,23 @@ class UdpLoadWorker(Worker):
         current; downlink reports every second, so silence of a quarter of a
         minute means the stream has stopped delivering.
         """
+        now = time.time() if now is None else now
         outcome = self._outcome
-        if outcome is None or outcome["state"] != OUTCOME_OK:
+        if outcome is None:
+            # Nothing yet is normal for the first burst, and not for a whole
+            # walk. Past the longest a first verdict can take, say so, or the
+            # chip would sit on "first test running" until End.
+            waited = now - self._started_at if self._started_at else 0.0
+            patience = STALL_AFTER_S + 15.0 + (
+                self.block_s + self.idle_s if self.direction == UPLINK else 0.0)
+            if waited <= patience:
+                return None
+            return {"state": OUTCOME_WARN, "kind": "stale",
+                    "detail": f"nothing yet after {waited:.0f}s", "advice": "",
+                    "ts": self._started_at}
+        if outcome["state"] != OUTCOME_OK:
             return outcome
-        age = (time.time() if now is None else now) - outcome["ts"]
+        age = now - outcome["ts"]
         limit = (STALE_DOWNLINK_OUTCOME_S if self.direction == DOWNLINK
                  else self.block_s + self.idle_s + STALL_AFTER_S + 15.0)
         if age <= limit:
@@ -718,10 +793,13 @@ class UdpLoadWorker(Worker):
         # A fresh start has nothing to say yet. Carrying the last walk's
         # verdict into this one would show a fault that may be long gone, or
         # sit on top of one that is new.
+        # What stays is how long each kind of trouble has been going on: a
+        # server that was "busy" before a pause and is still busy after it has
+        # been busy all that time, and a pause must not let it off.
         if self.enabled and not (self._thread and self._thread.is_alive()):
             self._outcome = None
-            self._trouble = None
             self._last_reason = None
+            self._started_at = time.time()
         super().start()
 
     def _run_stream(self) -> None:
@@ -731,6 +809,7 @@ class UdpLoadWorker(Worker):
         # stream that never yields a reading has a reason, and it is here.
         tail: deque[str] = deque(maxlen=20)
         measured = False
+        empty_since: float | None = None
         try:
             for line in proc.stdout:  # type: ignore[union-attr]
                 if self.stopping:
@@ -749,7 +828,20 @@ class UdpLoadWorker(Worker):
                     if reading.get("total"):
                         self._latest = reading
                         self._latest_ts = time.time()
+                        empty_since = None
                         self._note_ok()
+                    else:
+                        # Still connected, still printing, and nothing in it.
+                        # The stream is left alone, because it picks up by
+                        # itself when the link returns and a reconnect from
+                        # inside a dead zone can find the server still holding
+                        # the old test. But the phone is told.
+                        empty_since = empty_since or time.time()
+                        if time.time() - empty_since >= STALE_DOWNLINK_OUTCOME_S:
+                            self._note_trouble(
+                                "no_data",
+                                "the stream is connected but nothing has "
+                                f"arrived for {STALE_DOWNLINK_OUTCOME_S:.0f}s")
                 if self.budget_spent:
                     self.emit("warning", f"{self.name}: run data budget reached")
                     self._set_outcome(OUTCOME_WARN, "budget")
@@ -783,13 +875,15 @@ class UdpLoadWorker(Worker):
                       "encryption; retrying with the padding used before 3.17")
             return
 
-        # What iperf3 said decides what kind of trouble this is, and whether
-        # ping is getting through decides whose: "unable to connect" in a dead
-        # zone is the dead zone, and the same words on a working link are a
-        # server that has gone.
+        # What iperf3 said decides what kind of trouble this is, and how the
+        # link was while it tried decides whose: "unable to connect" in a dead
+        # zone is the dead zone, and the same words on a clean link are a
+        # server that has gone. The link over the whole attempt, not at its
+        # last instant: ten seconds of nothing with one ping reply at the end
+        # is a dead zone ending.
         match = ERROR_RE.search(text)
         said = match.group("message") if match else None
-        kind = error_kind(said, self._link_now())
+        kind = error_kind(said, self._link_during_attempt())
         self._note_trouble(kind, plain_reason(kind, said, parse_error(text) or fallback))
 
     def _run_block(self) -> None:
@@ -811,11 +905,25 @@ class UdpLoadWorker(Worker):
                     return
                 output.append(line)
                 reading = self._consume(line)
-                if self._engaged and sending_from is None:
-                    # The server has set the test up, so datagrams start now.
-                    # Only from here does this test own the uplink: until the
-                    # modem's buffer has drained again, whatever ping sees is
-                    # partly the test's doing rather than the garage's.
+                now = time.time()
+                began: float | None = None
+                if reading and reading.get("loss_pct") is None:
+                    interval_ends.append(now)
+                    # An interval line says how far into the test it ends, so
+                    # each one is an estimate of when the test began. iperf3
+                    # prints nothing at all until the first of them, a second
+                    # in, so "now" would be a second late, and lines can be
+                    # held up further but never arrive early: the earliest
+                    # estimate is the right one.
+                    began = now - reading["end_s"]
+                elif self._engaged and sending_from is None:
+                    began = now
+                if began is not None and (sending_from is None
+                                          or began < sending_from - 0.1):
+                    # The server has set the test up and datagrams are going
+                    # out. Only from here does this test own the uplink: until
+                    # the modem's buffer has drained again, whatever ping sees
+                    # is partly the test's doing rather than the garage's.
                     #
                     # Not from launch. An attempt that never gets this far
                     # (a dead link, a server that does not answer) puts
@@ -823,12 +931,10 @@ class UdpLoadWorker(Worker):
                     # took them out of dead-zone detection in exactly the
                     # places it is there for. It also counted every handshake
                     # as a second in which the rig "sent and nothing arrived".
-                    sending_from = time.time()
+                    sending_from = began
                     self._sending_from = sending_from
                     self._sending_until = sending_from + self.block_s
                     self._load_until = self._sending_until + self.settle_s
-                if reading and reading.get("loss_pct") is None:
-                    interval_ends.append(time.time())
                 if self.budget_spent:
                     self.emit("warning", f"{self.name}: run data budget reached")
                     return
@@ -865,20 +971,30 @@ class UdpLoadWorker(Worker):
             return
 
         jitter, loss, mbps = FIELDS[UPLINK]
+        # When the test began, from when the rig's own interval lines landed.
+        # Line n ends n seconds in, so each is an estimate of the start, and
+        # the earliest is the one to believe: a line can be held up, and the
+        # last of every burst is, until the end-of-test exchange has gone
+        # round, but none arrives early. Timing each reading by its own line
+        # instead put that last second one sample late on any real link, and
+        # left a second in every burst marked "sent" with nothing on it. That
+        # absorbs the control-channel setup too, which ``started`` does not.
+        if interval_ends:
+            began = min(end - (n + 1) for n, end in enumerate(interval_ends))
+        else:
+            began = started
         backfill: list[tuple[float, dict]] = []
-        for index, reading in enumerate(readings):
-            # Prefer the wall clock recorded when the rig's own line for this
-            # same second arrived: it absorbs the control-channel setup the
-            # elapsed offsets do not know about. Fall back to the offsets when
-            # the two ends disagree about how many seconds there were.
-            if index < len(interval_ends):
-                ts = interval_ends[index] - 0.5
-            else:
-                ts = started + (reading["start_s"] + reading["end_s"]) / 2
+        for reading in readings:
+            ts = began + (reading["start_s"] + reading["end_s"]) / 2
             backfill.append((ts, {
                 jitter: reading["jitter_ms"],
                 loss: reading["loss_pct"],
                 mbps: round(reading["mbps"], 3),
+                # A second the server received datagrams in is a second the
+                # rig was sending, whatever was known when the sample was
+                # written. The first second of every burst is not known then:
+                # iperf3 says nothing until it is over.
+                "uplink_loaded": LOAD_SENDING,
             }))
 
         self._latest = readings[-1]
@@ -967,6 +1083,7 @@ class UdpLoadWorker(Worker):
     def begin_run(self) -> None:
         self._run_bytes = 0
         self._backfilled = 0
+        self._trouble_since.clear()
 
     # -- readings ------------------------------------------------------------
 

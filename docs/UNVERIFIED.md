@@ -305,10 +305,14 @@ measured, and what was not:
   particular the claim that ping answering means the link could have carried
   the test's control connection is an argument, not a measurement: ping goes
   to its own target, the test goes to Dallas.
-* **Chosen, not measured:** 80% of the silence with ping up before the server
-  is blamed, 20 s before "refused" or "unreachable" is a fault, two minutes
-  for "busy". The last has a measurement under it (46.6 s busy after a vanished
-  client); the others are judgement.
+* **Chosen, not measured:** the link has to have been *good* for 80% of an
+  attempt before the server is blamed, where good is what the banner calls
+  GOOD or DEGRADED and so rests on thresholds that are themselves provisional.
+  Then 20 s before "refused" is a fault, a minute for "unreachable", two
+  minutes for "busy". The last has a measurement under it (46.6 s busy after a
+  vanished client); the others are judgement. If a walk through a marginal
+  garage shows a red chip that a restart did not cure, the first number is the
+  one to doubt.
 * **Inferred:** that the wedge found on 2026-11-22 is what happened on
   2026-10-15. The symptom matches exactly and nobody looked at the server
   before it was rebooted. A flat-topped CPU graph for that server ending at the

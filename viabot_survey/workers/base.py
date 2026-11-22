@@ -57,7 +57,19 @@ class Worker:
         if not self.enabled:
             return
         if self._thread and self._thread.is_alive():
-            return
+            if not self._stop.is_set():
+                return
+            # Stopped a moment ago and not gone yet: stop() gives up waiting
+            # after five seconds, and a subprocess can take longer than that
+            # to die on a loaded Pi. Returning here used to leave the stop
+            # flag set, so the old thread then exited and nothing replaced it:
+            # a Resume pressed quickly after a Pause could leave the camera or
+            # the load test off for the rest of the walk.
+            self._thread.join(timeout=15.0)
+            if self._thread.is_alive():
+                log.error("%s is still stopping; cannot start it again yet", self.name)
+                self.emit("error", f"{self.name} did not stop and cannot be restarted")
+                return
         self._stop.clear()
         self._set_state(STATE_STARTING)
         self._thread = threading.Thread(target=self._loop, name=self.name, daemon=True)

@@ -25,6 +25,7 @@ from .storage import Storage
 from .workers import camera as camera_worker
 from .workers import CameraWorker, DnsWorker, Iperf3Worker, PingWorker, RouterWorker
 from .workers.publisher import PublisherWorker
+from .workers import udpload
 from .workers.udpload import DOWNLINK, UPLINK, UdpLoadWorker
 
 log = logging.getLogger(__name__)
@@ -141,7 +142,7 @@ class SurveyRunner:
             auth_padding=load["auth_padding"],
             # Ping is the only witness to whether a server that says nothing
             # is the server's doing or the garage's.
-            link_alive=self._link_alive,
+            link_quality=self._link_quality,
         )
         self.udp_up = UdpLoadWorker(
             direction=UPLINK,
@@ -218,8 +219,13 @@ class SurveyRunner:
                 log.exception("failed to persist event")
         return handler
 
-    def _link_alive(self) -> bool | None:
-        """Whether ping is being answered right now, or None if nothing can say.
+    def _link_quality(self) -> str | None:
+        """How ping is doing right now: good, poor or dead. None if unknown.
+
+        Three answers, not two. A link getting one ping in five through is not
+        dead, and it is not a link a test's handshake can be expected to
+        finish over either; only a link this calls good is evidence against
+        the server. Good here means what the banner calls GOOD or DEGRADED.
 
         Read from the sampler's last reading rather than by asking ping again:
         this is called once a second from the load test's own threads, and the
@@ -227,8 +233,15 @@ class SurveyRunner:
         """
         if not self.ping.enabled:
             return None
-        loss = (self._last_sample or {}).get("loss_pct")
-        return None if loss is None else loss < 100
+        sample = self._last_sample or {}
+        loss = sample.get("loss_pct")
+        if loss is None:
+            return None
+        if loss >= 100:
+            return udpload.LINK_DEAD
+        if sample.get("status") in (STATUS_GOOD, STATUS_DEGRADED):
+            return udpload.LINK_GOOD
+        return udpload.LINK_POOR
 
     def _on_throughput(self, result: dict) -> None:
         with self._lock:

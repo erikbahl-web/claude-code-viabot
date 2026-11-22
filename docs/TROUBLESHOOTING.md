@@ -109,8 +109,11 @@ chip on the phone says the same thing as it happens:
 | grey, "first test running" | Uplink only reports when a burst ends, so the first seconds of a walk have nothing yet | Wait for it to turn green or red before walking off |
 | green, "measuring" | Readings are arriving in both directions | Nothing |
 | amber, "no link" or "test cut off" | A dead zone took the test down with it | Nothing. That is what the walk is for |
+| amber, "link too weak for the test" or "no answer from the server" | The link is there but patchy, and the test could not get started over it | Nothing. A patchy link is never blamed on the server |
+| amber, "connected, nothing arriving" | The downlink stream is up and delivering nothing | Nothing. It picks up by itself when the link returns |
+| amber, "nothing yet after ..." | A direction has not managed one result since Start or Resume | Wait a burst or two; if it stays, look at what the report quotes |
 | amber, "server busy with another test" | Normal for up to a minute after any dead zone | Nothing unless it turns red |
-| red, "server not answering" | The server took the connection and never spoke, while ping was fine. Its test service is stuck | Restart the server. Rebooting it from the hosting dashboard works without the root password |
+| red, "server not answering" | The test connected and heard nothing back for 45 s while ping was clean. The server's test service is stuck | Restart the server. Rebooting it from the hosting dashboard works without the root password |
 | red, "server stuck on a dead test" | It has answered "busy" for over two minutes | Restart the server |
 | red, "server rejected the login" | Password, clock or iperf3 version. See below | |
 | red, "cannot reach the server, though the link is up" | The server is down, or its address or firewall changed | Check the server is running |
@@ -160,9 +163,10 @@ To clear one by hand in the meantime:
 sudo systemctl restart viabot-iperf3@5201 viabot-iperf3@5202
 ```
 
-**"The server took the connection and then said nothing"** is a stuck server,
-not a bad garage. The rig only says it when ping was getting through for the
-whole silence, so the link was demonstrably there. On 2026-10-15 this went on
+**"The test connected to the server and then heard nothing back"** is a stuck
+server, not a bad garage. The rig only says it when ping was getting through
+*cleanly* for the whole silence, so the link was demonstrably good. On a patchy
+link it says "no answer from the server" instead and blames nobody. On 2026-10-15 this went on
 for two whole walks. Restart the server; the chip goes green within a burst or
 two of it coming back, and the log says "working again".
 
