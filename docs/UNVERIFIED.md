@@ -283,6 +283,74 @@ The first real uplink measurement, on 2026-09-17, was 3.22 Mbit/s received over
 5 Mbit/s quoted for teleop and well above the 645 kbit/s measured from a real
 session, but it is one 3-second test from a spot that is not a garage.
 
+## The stuck-server detection, and what it rests on (2026-11-22)
+
+Built after the 2026-10-15 walks came back with no uplink data. What was
+measured, and what was not:
+
+* **Measured, on loopback, iperf3 3.16:** a wedged server and a blackholed
+  port both make the client print nothing at all for 50 s. With
+  `--connect-timeout` the blackholed connect ends by itself in the time asked
+  for; the wedged one stays silent. The rig's worker was then run against a
+  server wedged for real and reported it as a fault, reported the same silence
+  as "no link" when told ping was dead, and recovered when the server was
+  replaced.
+* **Not run: iperf3 3.18, which is what the rig has.** Its source was read:
+  the flag exists and "Connecting to host" is printed at the same point. The
+  first office test after this change is the first time the flag meets 3.18.
+  If the flag were rejected, every burst would fail at once and the chip would
+  sit amber on "no readings".
+* **Not tested: a real cellular link.** Everything above is loopback. In
+  particular the claim that ping answering means the link could have carried
+  the test's control connection is an argument, not a measurement: ping goes
+  to its own target, the test goes to Dallas.
+* **Chosen, not measured:** 80% of the silence with ping up before the server
+  is blamed, 20 s before "refused" or "unreachable" is a fault, two minutes
+  for "busy". The last has a measurement under it (46.6 s busy after a vanished
+  client); the others are judgement.
+* **Inferred:** that the wedge found on 2026-11-22 is what happened on
+  2026-10-15. The symptom matches exactly and nobody looked at the server
+  before it was rebooted. A flat-topped CPU graph for that server ending at the
+  reboot would settle it.
+* **Never observed in the field:** the downlink zombie. On loopback a vanished
+  `-R -t 0` client left the server transmitting at nobody for nineteen minutes
+  and answering "busy" throughout. Whether a carrier's NAT lets that persist is
+  unknown. If the next walk after a power cut shows "server busy" for downlink
+  from its first second, this is why.
+
+## What Formant's own documentation says (read 2026-11-22)
+
+From docs.formant.io, with each page's own "updated" date. None of it has been
+tried on the rig.
+
+* **Bandwidth table** ("System requirements", 2025-11-11): minimum upload for
+  one video stream is 1 Mbit/s at 360p, 2.5 at 480p, 5 at 720p, 8 at 1080p,
+  on top of "a consistent 3 Mbps connection in both directions". This is where
+  the 5 Mbit/s figure came from.
+* **Intended bitrates** ("Video performing poorly", 2025-11-11): 256 kbit/s at
+  360p, 1024 at 480p, 2048 at 720p, 4096 at 1080p. The session measured on
+  2026-09-12 sent 645, which fits none of them exactly: a configured bitrate,
+  or 480p pulled down by the adaptive setting. The robot's own configuration
+  would say.
+* **It adapts** (same page, and "Video encoding", 2026-05-11): adaptive bitrate
+  is on by default and "packet loss will cause the Formant Agent to crush the
+  bitrate until there is no packet loss". The rig's uplink test offers a fixed
+  3 Mbit/s and counts what is lost. It therefore measures a stream Formant
+  never sends, which is the argument for running Formant itself.
+* **No ROS needed:** the agent reads a USB camera by device path, or RTSP,
+  RTMP or UDP ("Add a video stream", 2025-11-11). `WEBRTC_INTERFACE` pins the
+  session to one interface ("System requirements").
+* **Supported platforms:** Ubuntu 18.04 to 24.04 on amd64 and arm64; Docker is
+  the recommended install. Raspberry Pi OS is not listed. The newest agent
+  image was 1.378.0, tagged 2026-10-28.
+* **One real-time connection per device** ("Real-time SDK guide", 2025-11-11):
+  a new one disconnects the old. A bot watching the rig and a person watching
+  the rig cannot both be connected.
+* **Read from the SDK's source by a research pass, not from prose and not by
+  hand:** video arrives as H.264 frames in data-channel messages with a device
+  timestamp on each; the SDK pings every 250 ms and reports loss and jitter;
+  Formant's own Node example drives headless Chrome, last touched 2023-08-09.
+
 ## What the project is actually for
 
 Worth writing down, because it changes what counts as a good measurement.

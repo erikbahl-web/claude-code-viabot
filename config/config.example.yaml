@@ -193,6 +193,13 @@ udp_load:
   # Mbit/s" without disturbing a survey, use:
   #     ./scripts/capacity_test.sh --udp 5M
   uplink_bitrate: 3M
+  # What one robot was MEASURED sending at its peak, in Mbit/s (764 kbit/s,
+  # 2026-09-12, see above). The report counts the uplink seconds that
+  # delivered less than this. It is a reference line and nothing more: it
+  # does not decide what counts as a dead zone, and nobody has established
+  # what the robot can do without. Change it when a second session is
+  # measured, not to make a report look better.
+  uplink_robot_mbps: 0.764
 
   # --- the duty cycle, and why the uplink test is not continuous -----------
   # The rate above is offered, not guaranteed, and the modem holds a deep

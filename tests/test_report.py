@@ -161,7 +161,10 @@ def test_a_long_walk_with_no_uplink_blames_the_server_not_the_operator():
     stats = report.load_stats(_short_walk(600), {"uplink_block_s": 30})
     reason = stats["uplink"]["absent_reason"]
     assert "Walk for at least" not in reason
-    assert "event log" in reason
+    assert "not one of them reported" in reason
+    # The reader cannot open the rig's event log, so the page must not send
+    # them to it.
+    assert "event log" not in reason
 
 
 def test_the_walk_has_to_outlast_the_whole_duty_cycle_not_just_the_burst():
@@ -498,3 +501,202 @@ def test_the_turn_control_is_not_a_tab():
     rotate = page[page.index("data-rotate"):]
     assert 'class="tab"' not in rotate[:200]
     assert "data-tab" not in rotate[:200]
+
+
+# ---- the rig's own log, on the page ----------------------------------------
+#
+# The event log lives on a card in a case. The report used to say "check the
+# event log" to a reader with no way of opening it, and on 2026-10-15 two
+# walks came back with no uplink data and nothing on the page that said why.
+
+STUCK = ("udp_up: the server took the connection and then said nothing for "
+         "45s, while ping was getting through. The server's uplink test "
+         "service is stuck: restart the server. There will be no uplink "
+         "readings until then")
+
+
+def _event(offset, message, level="warning", source="udp_up"):
+    return {"ts": BASE + offset, "level": level, "source": source,
+            "message": message}
+
+
+def test_a_fault_that_lasts_the_walk_is_one_line_not_sixty():
+    log = report.run_log([_event(i * 67, STUCK, "error") for i in range(9)])
+    assert len(log) == 1
+    assert log[0]["count"] == 9
+    assert log[0]["ts"] == BASE and log[0]["last_ts"] == BASE + 8 * 67
+
+
+def test_the_log_keeps_what_went_wrong_and_drops_the_narration():
+    log = report.run_log([
+        _event(0, "run r1 started", "info", "runner"),
+        _event(5, "udp_up: no link"),
+        _event(40, "udp_up: working again", "info"),
+        _event(41, "queued 3 file(s) for upload", "info", "publisher"),
+        _event(50, "UNDERVOLTAGE: the Pi's supply is sagging.", "error", "power"),
+    ])
+    assert [e["message"] for e in log] == [
+        "udp_up: no link", "udp_up: working again",
+        "UNDERVOLTAGE: the Pi's supply is sagging."]
+
+
+def test_the_same_words_from_a_different_part_of_the_rig_are_not_folded():
+    log = report.run_log([_event(0, "no reply", source="udp_up"),
+                          _event(1, "no reply", source="udp_down")])
+    assert len(log) == 2
+
+
+def test_an_error_is_quoted_on_the_first_page_in_the_rigs_own_words():
+    page = report.render_html(dict(REPORT, events=report.run_log(
+        [_event(i * 67, STUCK, "error") for i in range(9)])))
+    result = page[page.index('id="panel-result"'):page.index('id="panel-detail"')]
+    assert "The rig logged 1 error during this walk" in result
+    assert "restart the server" in result
+    assert "×9" in result
+
+
+def test_everything_logged_is_listed_under_detail():
+    page = report.render_html(dict(REPORT, events=report.run_log([
+        _event(5, "udp_up: no link"),
+        _event(90, "camera: recording stopped", "error", "camera")])))
+    detail = page[page.index('id="panel-detail"'):]
+    assert "What the rig logged" in detail
+    assert "udp_up: no link" in detail
+    assert 'class="lv-error">camera: recording stopped' in detail
+
+
+def test_a_quiet_walk_says_nothing_went_wrong_rather_than_showing_an_empty_table():
+    page = render()
+    assert "No warnings and no errors were logged during this walk" in page
+    assert "The rig logged" not in page[:page.index('id="panel-detail"')]
+
+
+def test_the_page_never_sends_the_reader_to_a_log_they_cannot_open():
+    for events in ([], report.run_log([_event(0, STUCK, "error")])):
+        built = dict(REPORT, events=events, under_load=report.load_stats(
+            _no_load_walk(), {"enabled": True, "uplink_bitrate": "3M",
+                              "uplink_block_s": 10, "uplink_idle_s": 20}))
+        assert "event log" not in report.render_html(built)
+
+
+def test_a_missing_uplink_is_explained_with_what_the_load_test_said():
+    """The Oct 15 report: load test on, nothing measured, and the reason was
+    sitting in a database nobody could reach."""
+    built = dict(REPORT, events=report.run_log([_event(45, STUCK, "error")]),
+                 under_load=report.load_stats(
+                     _short_walk(600), {"enabled": True, "uplink_block_s": 10,
+                                        "uplink_idle_s": 20}))
+    page = report.render_html(built)
+    result = page[page.index('id="panel-result"'):page.index('id="panel-detail"')]
+    assert "Not measured on this run" in result
+    assert "What the load test said" in result
+    assert "service is stuck" in result
+
+
+def test_a_missing_uplink_with_nothing_logged_says_that_too():
+    """A failure nobody recorded and a failure somebody did are different
+    things to go looking for."""
+    built = dict(REPORT, under_load=report.load_stats(
+        _short_walk(600), {"enabled": True, "uplink_block_s": 10,
+                           "uplink_idle_s": 20}))
+    assert "The rig logged nothing from the load test" in report.render_html(built)
+
+
+def test_what_the_rig_said_cannot_inject_markup():
+    page = report.render_html(dict(REPORT, events=report.run_log([
+        _event(0, "<script>alert(1)</script>", "error", "<b>cam</b>")])))
+    assert "<script>alert(1)</script>" not in page
+    assert "<b>cam</b>" not in page
+
+
+def test_the_report_is_built_with_the_runs_own_events(storage):
+    storage.create_run("r1", label="Level 2")
+    storage.create_run("r2", label="Level 3")
+    storage.add_event("run r1 started", source="runner", run_id="r1", ts=BASE)
+    storage.add_event(STUCK, level="error", source="udp_up", run_id="r1", ts=BASE + 45)
+    storage.add_event(STUCK, level="error", source="udp_up", run_id="r1", ts=BASE + 112)
+    storage.add_event("another walk's problem", level="error", source="camera",
+                      run_id="r2", ts=BASE + 50)
+    storage.add_event("nobody's problem", level="error", source="power", ts=BASE + 60)
+
+    built = report.build_report(storage, storage.get_run("r1"))
+    assert [(e["message"], e["count"]) for e in built["events"]] == [(STUCK, 2)]
+
+
+# ---- uplink on the first page ----------------------------------------------
+
+def _bursty_walk(delivered, seconds=300):
+    """Ten seconds of uplink in every thirty, delivering what it is given."""
+    rows = []
+    for i in range(seconds):
+        sending = (i % 30) < 10
+        rows.append({"ts": BASE + i, "rtt_ms": 45.0, "loss_pct": 0.0,
+                     "uplink_loaded": 2 if sending else 0,
+                     "udp_up_loss_pct": 1.0 if sending else None,
+                     "udp_up_jitter_ms": 3.0 if sending else None,
+                     "udp_up_mbps": delivered(i) if sending else None})
+    return rows
+
+
+LOAD = {"enabled": True, "uplink_bitrate": "3M", "uplink_block_s": 10,
+        "uplink_idle_s": 20, "uplink_robot_mbps": 0.764}
+
+
+def test_uplink_seconds_too_thin_for_one_robot_stream_are_counted():
+    """The percentage at the top is judged from ping. Whether the robot's
+    video gets out is the uplink, and 764 kbit/s is the most one real session
+    was ever measured sending."""
+    stats = report.load_stats(
+        _bursty_walk(lambda i: 0.4 if i < 60 else 2.9), LOAD)
+    up = stats["uplink"]
+    assert up["seconds_measured"] == 100
+    assert up["measured_pct"] == 33.3
+    assert up["below_robot_seconds"] == 20
+    assert up["below_robot_pct"] == 20.0
+    assert up["robot_mbps"] == 0.764
+
+
+def test_the_uplink_summary_is_on_the_first_page():
+    built = dict(REPORT, under_load=report.load_stats(
+        _bursty_walk(lambda i: 0.4 if i < 60 else 2.9), LOAD))
+    page = report.render_html(built)
+    result = page[page.index('id="panel-result"'):page.index('id="panel-detail"')]
+    assert "Uplink: the robot's video going out" in result
+    assert "Below one robot stream" in result
+    assert "20s (20%)" in result
+    assert "not a tested requirement" in result
+
+
+def test_no_reference_rate_means_no_comparison_is_invented():
+    """An older config has no such key. The page must then say less, not make
+    a number up."""
+    without = {k: v for k, v in LOAD.items() if k != "uplink_robot_mbps"}
+    stats = report.load_stats(_bursty_walk(lambda i: 2.9), without)
+    assert "below_robot_seconds" not in stats["uplink"]
+    page = report.render_html(dict(REPORT, under_load=stats))
+    assert "Below one robot stream" not in page
+    assert "Median delivered" in page
+
+
+def test_a_walk_with_the_load_test_off_gets_no_uplink_heading():
+    page = report.render_html(dict(REPORT, under_load=report.load_stats(
+        _no_load_walk(), {"enabled": False})))
+    assert "Uplink: the robot's video going out" not in page
+
+
+# ---- a walk too short to judge ---------------------------------------------
+
+def test_a_walk_that_ended_inside_a_burst_is_not_called_empty():
+    """Samples were recorded; none could be judged. "No samples were recorded"
+    sent somebody looking for a recording fault that was not there."""
+    page = report.render_html(dict(
+        REPORT, runnable_pct=None, dead_zones=[],
+        summary={"dead_zone_count": 0, "judged_s": 0.0, "load_excluded_s": 9.0}))
+    assert "Too short to judge" in page
+    assert "No samples were recorded" not in page
+
+
+def test_a_walk_with_really_nothing_in_it_still_says_so():
+    page = report.render_html(dict(REPORT, runnable_pct=None, dead_zones=[],
+                                   summary={"dead_zone_count": 0}))
+    assert "No samples were recorded" in page

@@ -232,7 +232,7 @@ every hardware fact in this repo came from someone pasting terminal output.
 ## Checking it yourself
 
 ```bash
-.venv/bin/python -m pytest        # 316 tests, no hardware needed
+.venv/bin/python -m pytest        # about 400 tests, no hardware needed
 ```
 
 Workers are tested through their parsing and command-building functions rather

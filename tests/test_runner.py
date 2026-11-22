@@ -267,3 +267,135 @@ def test_a_loaded_second_never_becomes_a_dead_zone_end_to_end(runner, storage, m
     assert summary["judged_s"] == 10.0
     assert summary["walked_s"] == 20.0
     assert summary["runnable_pct"] == 100.0
+
+
+# ---- the load test's chip ---------------------------------------------------
+#
+# On 2026-10-15 the server's uplink service was stuck for two whole walks.
+# Every reading on the phone looked healthy, and both walks came back with no
+# uplink data. The chip is what would have said so in the first minute.
+
+def _with_load_test(runner, monkeypatch):
+    for worker in runner.udp_load:
+        worker.enabled = True
+        monkeypatch.setattr(worker, "start", lambda: None)
+    return runner
+
+
+def _outcome(worker, kind, fault=False):
+    from viabot_survey.workers import udpload
+    state = (udpload.OUTCOME_OK if kind == "ok"
+             else udpload.OUTCOME_FAIL if fault else udpload.OUTCOME_WARN)
+    if kind == "ok":
+        worker._note_ok()
+    else:
+        worker._set_outcome(state, kind, fault)
+
+
+def test_the_chip_is_off_when_the_load_test_is_switched_off(runner):
+    assert runner.health()["load"] == {"state": "off", "detail": "disabled in config"}
+
+
+def test_the_chip_is_idle_between_walks(runner, monkeypatch):
+    """The load test only runs during a walk, so before one there is nothing
+    it can honestly say about the server."""
+    _with_load_test(runner, monkeypatch)
+    assert runner.health()["load"]["state"] == "idle"
+
+
+def test_the_chip_is_grey_not_green_until_the_first_burst_reports(runner, monkeypatch):
+    _with_load_test(runner, monkeypatch).start_run(label="Level 2")
+    load = runner.health()["load"]
+    assert load == {"state": "idle", "detail": "first test running"}
+
+
+def test_the_chip_is_green_once_both_directions_are_measuring(runner, monkeypatch):
+    _with_load_test(runner, monkeypatch).start_run(label="Level 2")
+    for worker in runner.udp_load:
+        _outcome(worker, "ok")
+    assert runner.health()["load"] == {"state": "ok", "detail": "measuring"}
+
+
+def test_a_stuck_server_is_red_and_names_the_direction(runner, monkeypatch):
+    _with_load_test(runner, monkeypatch).start_run(label="Level 2")
+    _outcome(runner.udp_up, "silent", fault=True)
+    _outcome(runner.udp_down, "ok")
+    load = runner.health()["load"]
+    assert load == {"state": "fail",
+                    "detail": "server not answering (uplink). Restart the server."}
+
+
+def test_a_dead_zone_is_amber_and_never_red(runner, monkeypatch):
+    """A dead zone takes the load test down too. That is the garage's doing,
+    and a chip that goes red in every dead zone teaches its operator to stop
+    looking at it."""
+    _with_load_test(runner, monkeypatch).start_run(label="Level 2")
+    _outcome(runner.udp_up, "no_link")
+    _outcome(runner.udp_down, "interrupted")
+    load = runner.health()["load"]
+    assert load["state"] == "warn"
+    assert load["detail"] == "no link (uplink); test cut off (downlink)"
+
+
+def test_a_fault_in_one_direction_outranks_a_dead_zone_in_the_other(runner, monkeypatch):
+    _with_load_test(runner, monkeypatch).start_run(label="Level 2")
+    _outcome(runner.udp_up, "no_link")
+    _outcome(runner.udp_down, "busy", fault=True)
+    assert runner.health()["load"]["state"] == "fail"
+
+
+def test_the_same_fault_both_ways_is_said_once(runner, monkeypatch):
+    _with_load_test(runner, monkeypatch).start_run(label="Level 2")
+    _outcome(runner.udp_up, "silent", fault=True)
+    _outcome(runner.udp_down, "silent", fault=True)
+    assert runner.health()["load"]["detail"] == (
+        "server not answering (uplink, downlink). Restart the server.")
+
+
+def test_a_paused_walk_shows_the_chip_as_idle(runner, monkeypatch):
+    _with_load_test(runner, monkeypatch).start_run(label="Level 2")
+    _outcome(runner.udp_up, "silent", fault=True)
+    runner.pause()
+    assert runner.health()["load"]["state"] == "idle"
+
+
+def test_a_broken_chip_never_takes_the_phone_down(runner, monkeypatch):
+    """Health feeds the only screen the operator has. One chip failing to work
+    itself out must cost that chip and nothing else."""
+    def boom(run_active):
+        raise RuntimeError("no")
+    monkeypatch.setattr(runner, "_load_health", boom)
+    health = runner.health()
+    assert health["load"] == {"state": "unknown", "detail": "not readable"}
+    assert {"camera", "link", "power", "disk", "clock"} <= set(health)
+
+
+def test_ping_is_the_witness_for_whether_the_link_is_up(runner):
+    assert runner._link_alive() is None            # ping is off in this fixture
+    runner.ping.enabled = True
+    assert runner._link_alive() is None            # ...and has not reported yet
+    runner._last_sample = {"loss_pct": 100.0}
+    assert runner._link_alive() is False
+    runner._last_sample = {"loss_pct": 40.0}
+    assert runner._link_alive() is True
+    assert runner.udp_up._link_now() is True       # the workers ask the runner
+
+
+def test_a_walk_that_ended_inside_a_burst_is_logged_as_too_short(runner, storage, monkeypatch):
+    """Every second of it was the rig's own upload burst, so none could be
+    judged. That is not "no samples recorded", which is what it used to say."""
+    monkeypatch.setattr(runner.ping, "enabled", True)
+    monkeypatch.setattr(runner.ping, "snapshot",
+                        lambda now=None: {"loss_pct": 0.0, "rtt_ms": 40.0})
+    runner.udp_up.enabled = True
+    monkeypatch.setattr(runner.udp_up, "start", lambda: None)
+    monkeypatch.setattr(type(runner.udp_up), "load_state",
+                        property(lambda self: 2))
+    run_id = runner.start_run(label="Level 2")["id"]
+    for _ in range(4):
+        runner.collect_sample()
+    runner.stop_run()
+
+    said = [e["message"] for e in storage.recent_events(run_id=run_id)]
+    assert any("too short to judge" in message for message in said)
+    assert not any("no samples recorded" in message for message in said)

@@ -544,7 +544,7 @@ def test_a_test_that_stops_talking_is_killed_rather_than_hanging_the_worker(monk
 
     assert elapsed < 10, f"the hung process ran for {elapsed:.1f}s"
     assert worker._stalls == 1
-    assert any("stopped responding" in message for _, message in events)
+    assert any("no answer from the server" in message for _, message in events)
 
 
 def test_a_test_that_keeps_talking_is_left_alone(monkeypatch):
@@ -571,3 +571,402 @@ def test_the_stall_count_is_visible(monkeypatch):
     never starts, and the dashboard should be able to tell them apart."""
     worker = UdpLoadWorker(server="example.invalid", direction=UPLINK)
     assert worker.snapshot()["stalls"] == 0
+
+
+# ---- telling a stuck server from a dead zone -------------------------------
+#
+# On 2026-10-15 the server's uplink service was stuck for two whole walks. The
+# rig logged "the test stopped responding" once a minute, which is also what a
+# dead zone looks like, and both walks came back with no uplink data. The
+# strings below are what iperf3 3.16 really printed in each case, reproduced
+# on 2026-11-22: a wedged server and a blackholed port both print nothing at
+# all, and only --connect-timeout makes the second one end by itself.
+
+CONNECT_TIMED_OUT = (
+    "iperf3: error - unable to connect to server - server may have stopped "
+    "running or use a different port, firewall issue, etc.: Connection timed out")
+CONNECT_REFUSED = (
+    "iperf3: error - unable to connect to server - server may have stopped "
+    "running or use a different port, firewall issue, etc.: Connection refused")
+SERVER_BUSY = "iperf3: error - the server is busy running a test. try again later"
+STREAM_LOST = (
+    "iperf3: error - unable to read from stream socket: "
+    "Resource temporarily unavailable")
+# A reverse stream that has stopped delivering still prints a line a second.
+EMPTY_SECOND = "[  5]   3.00-4.00   sec  0.00 Bytes  0.00 bits/sec  0.012 ms  0/0 (0%)  "
+
+
+def _said(text: str) -> str:
+    return udpload.ERROR_RE.search(text).group("message")
+
+
+def test_a_dead_link_is_made_to_end_the_attempt_by_itself():
+    """Without this a connect into a dead link is silent for as long as the
+    kernel keeps retrying, which is exactly what a wedged server looks like.
+    With it, silence can only mean the connection was made."""
+    for direction in (UPLINK, DOWNLINK):
+        argv = UdpLoadWorker("10.0.0.1", direction).build_command()
+        assert argv[argv.index("--connect-timeout") + 1] == str(udpload.CONNECT_TIMEOUT_MS)
+    assert udpload.CONNECT_TIMEOUT_MS < udpload.STALL_AFTER_S * 1000
+
+
+@pytest.mark.parametrize("text, link_up, kind", [
+    (CONNECT_TIMED_OUT, False, "no_link"),      # a dead zone
+    (CONNECT_TIMED_OUT, None, "no_link"),       # nobody can say: assume the place
+    (CONNECT_TIMED_OUT, True, "unreachable"),   # ping is fine, the server is gone
+    (CONNECT_REFUSED, False, "refused"),
+    (CONNECT_REFUSED, True, "refused"),
+    (SERVER_BUSY, True, "busy"),
+    (STREAM_LOST, True, "interrupted"),
+    ("iperf3: error - test authorization failed", True, "auth"),
+])
+def test_the_same_words_mean_different_things_on_a_dead_link(text, link_up, kind):
+    assert udpload.error_kind(_said(text), link_up) == kind
+
+
+def test_a_test_that_never_spoke_is_not_called_an_error():
+    assert udpload.error_kind(None, True) == "no_readings"
+
+
+def test_silence_with_the_link_up_is_blamed_on_the_server():
+    """The connection was made, ping was getting through for the whole
+    silence, and the server never set the test up. That is a stuck server, and
+    it is the one case somebody has to act on."""
+    worker = UdpLoadWorker("10.0.0.1", UPLINK)
+    kind, words = worker._stall_verdict(link_up=44, link_down=1)
+    assert kind == "silent"
+    assert "restart the server" in words
+    assert "stopped responding" not in words
+
+
+def test_silence_with_no_link_is_blamed_on_the_place():
+    worker = UdpLoadWorker("10.0.0.1", UPLINK)
+    kind, words = worker._stall_verdict(link_up=2, link_down=43)
+    assert kind == "no_link"
+    assert "the server is not the problem" in words
+
+
+def test_silence_nobody_can_explain_blames_nobody():
+    """With ping switched off, or a link that came and went, there is no
+    witness. Blaming a healthy server costs somebody a restart mid-walk."""
+    worker = UdpLoadWorker("10.0.0.1", UPLINK)
+    assert worker._stall_verdict(link_up=0, link_down=0)[0] == "no_answer"
+    assert worker._stall_verdict(link_up=22, link_down=23)[0] == "no_answer"
+    assert worker._stall_verdict(link_up=3, link_down=0)[0] == "no_answer"
+
+
+def test_a_test_that_stalls_part_way_is_the_link_dropping():
+    """Once the server has set the test up, going quiet is what a dead zone
+    does to it. That must never be reported as a server fault."""
+    worker = UdpLoadWorker("10.0.0.1", UPLINK)
+    worker._consume("[  5] local 10.0.0.2 port 40112 connected to 10.0.0.1 port 5201")
+    assert worker._stall_verdict(link_up=45, link_down=0)[0] == "interrupted"
+
+
+def test_connecting_is_not_the_same_as_the_server_setting_the_test_up():
+    worker = UdpLoadWorker("10.0.0.1", UPLINK)
+    worker._consume("Connecting to host 10.0.0.1, port 5201")
+    assert worker._engaged is False
+    worker._consume(SENDER_LINE)
+    assert worker._engaged is True
+
+
+def _stalled_worker(monkeypatch, link_alive):
+    """Run the real watchdog against a process that never says anything."""
+    monkeypatch.setattr(udpload, "STALL_AFTER_S", 2.0)
+    monkeypatch.setattr(udpload, "MIN_LINK_SAMPLES", 1)
+    events = []
+    worker = UdpLoadWorker(server="example.invalid", direction=UPLINK,
+                           link_alive=link_alive,
+                           on_event=lambda level, msg: events.append((level, msg)))
+    monkeypatch.setattr(worker, "build_command", lambda: ["sleep", "30"])
+    monkeypatch.setattr(worker, "build_env", lambda: None)
+    worker._launch().wait(timeout=15)
+    return worker, events
+
+
+def test_a_stuck_server_turns_the_chip_red_and_says_what_to_do(monkeypatch):
+    worker, events = _stalled_worker(monkeypatch, link_alive=lambda: True)
+    assert events == [("error", events[0][1])]
+    assert "restart the server" in events[0][1]
+    outcome = worker.current_outcome()
+    assert outcome["state"] == udpload.OUTCOME_FAIL
+    assert outcome["detail"].startswith("server not answering")
+    assert worker.state == "failed"
+
+
+def test_a_dead_zone_only_ever_turns_it_amber(monkeypatch):
+    worker, events = _stalled_worker(monkeypatch, link_alive=lambda: False)
+    assert [level for level, _ in events] == ["warning"]
+    assert worker.current_outcome()["state"] == udpload.OUTCOME_WARN
+    assert worker.current_outcome()["detail"] == "no link"
+
+
+def test_a_witness_that_falls_over_is_treated_as_absent(monkeypatch):
+    def broken():
+        raise RuntimeError("ping is not there")
+    worker, events = _stalled_worker(monkeypatch, link_alive=broken)
+    assert worker.current_outcome()["kind"] == "no_answer"
+
+
+def test_a_killed_test_is_explained_once_not_twice(monkeypatch):
+    """The watchdog says why it killed the test. The reader then wakes with an
+    empty transcript, and must not overwrite that with "no readings"."""
+    monkeypatch.setattr(udpload, "STALL_AFTER_S", 1.0)
+    events = []
+    worker = UdpLoadWorker(server="example.invalid", direction=UPLINK, idle_s=0,
+                           on_event=lambda level, msg: events.append((level, msg)))
+    monkeypatch.setattr(worker, "build_command", lambda: ["sleep", "30"])
+    monkeypatch.setattr(worker, "build_env", lambda: None)
+    worker._run_block()
+    assert len(events) == 1
+    assert worker.current_outcome()["kind"] == "no_answer"
+
+
+def test_stopping_mid_burst_is_not_reported_as_a_failure(monkeypatch):
+    """Every End and every Pause lands inside a burst as often as not. That is
+    the operator's doing, and it must not put a warning in the log."""
+    import threading
+    events = []
+    worker = UdpLoadWorker(server="example.invalid", direction=UPLINK, idle_s=0,
+                           on_event=lambda level, msg: events.append((level, msg)))
+    monkeypatch.setattr(worker, "build_command", lambda: ["sleep", "30"])
+    monkeypatch.setattr(worker, "build_env", lambda: None)
+    thread = threading.Thread(target=worker._run_block)
+    thread.start()
+    assert _wait_for(lambda: worker._proc is not None, seconds=5)
+    worker._stop.set()
+    worker.on_stop()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert events == []
+    assert worker.current_outcome() is None
+
+
+# ---- when trouble becomes a fault ------------------------------------------
+
+def test_a_rejected_login_is_a_fault_at_once():
+    worker = UdpLoadWorker("10.0.0.1", UPLINK, auth_padding="pkcs1")
+    worker._fail_with_reason("iperf3: error - test authorization failed", "quiet")
+    assert worker.current_outcome()["state"] == udpload.OUTCOME_FAIL
+    assert worker.state == "failed"
+
+
+def test_a_busy_server_is_only_a_fault_once_it_has_been_busy_too_long():
+    """Measured on 3.16, a server answers "busy" for 46.6 s after a rig vanishes
+    mid-test. That is normal after any dead zone. Busy for minutes is a test
+    nobody is on the other end of, and only a restart ends it."""
+    events = []
+    worker = UdpLoadWorker("10.0.0.1", DOWNLINK,
+                           on_event=lambda level, msg: events.append((level, msg)))
+    worker._fail_with_reason(SERVER_BUSY, "quiet")
+    assert worker.current_outcome()["state"] == udpload.OUTCOME_WARN
+    assert worker.current_outcome()["detail"] == "server busy with another test"
+
+    worker._trouble = ("busy", time.time() - udpload.ESCALATE_AFTER_S["busy"] - 1)
+    worker._fail_with_reason(SERVER_BUSY, "quiet")
+    assert worker.current_outcome()["state"] == udpload.OUTCOME_FAIL
+    assert [level for level, _ in events] == ["warning", "error"]
+    assert "restart the server" in events[-1][1]
+
+
+def test_a_server_that_refuses_for_a_moment_is_not_a_fault():
+    """A server being restarted refuses connections for a second or two."""
+    worker = UdpLoadWorker("10.0.0.1", UPLINK)
+    worker._fail_with_reason(CONNECT_REFUSED, "quiet")
+    assert worker.current_outcome()["state"] == udpload.OUTCOME_WARN
+
+    worker._trouble = ("refused", time.time() - udpload.ESCALATE_AFTER_S["refused"] - 1)
+    worker._fail_with_reason(CONNECT_REFUSED, "quiet")
+    assert worker.current_outcome()["state"] == udpload.OUTCOME_FAIL
+
+
+def test_a_dead_zone_never_becomes_a_fault_however_long_it_lasts():
+    worker = UdpLoadWorker("10.0.0.1", UPLINK, link_alive=lambda: False)
+    worker._fail_with_reason(CONNECT_TIMED_OUT, "quiet")
+    worker._trouble = ("no_link", time.time() - 3600)
+    worker._fail_with_reason(CONNECT_TIMED_OUT, "quiet")
+    assert worker.current_outcome()["state"] == udpload.OUTCOME_WARN
+    assert worker.state == "degraded"
+
+
+def test_a_different_kind_of_trouble_starts_its_own_clock():
+    worker = UdpLoadWorker("10.0.0.1", UPLINK)
+    worker._trouble = ("busy", time.time() - 3600)
+    worker._fail_with_reason(CONNECT_REFUSED, "quiet")
+    assert worker.current_outcome()["state"] == udpload.OUTCOME_WARN
+
+
+def test_the_same_trouble_is_said_once_and_again_after_it_has_been_fixed():
+    events = []
+    worker = UdpLoadWorker("10.0.0.1", UPLINK, on_backfill=lambda r: None,
+                           on_event=lambda level, msg: events.append((level, msg)))
+    for _ in range(4):
+        worker._fail_with_reason(STREAM_LOST, "quiet")
+    assert len(events) == 1
+
+    worker._absorb_server_output(SERVER_OUTPUT, started=time.time(), interval_ends=[])
+    worker._fail_with_reason(STREAM_LOST, "quiet")
+    assert len(events) == 2
+
+
+def test_recovering_from_a_fault_is_announced():
+    events = []
+    worker = UdpLoadWorker("10.0.0.1", UPLINK, auth_padding="pkcs1",
+                           on_backfill=lambda r: None,
+                           on_event=lambda level, msg: events.append((level, msg)))
+    worker._fail_with_reason("iperf3: error - test authorization failed", "quiet")
+    worker._absorb_server_output(SERVER_OUTPUT, started=time.time(), interval_ends=[])
+    assert events[-1] == ("info", "udp_up: working again")
+    assert worker.current_outcome()["state"] == udpload.OUTCOME_OK
+
+
+# ---- what the phone is told between attempts -------------------------------
+
+def test_a_good_burst_stays_good_until_the_next_one_reports():
+    """Uplink reports once per burst. Showing "unknown" for the twenty seconds
+    between bursts would make the chip blink for the whole walk."""
+    worker = UdpLoadWorker("10.0.0.1", UPLINK, block_s=10, idle_s=20,
+                           on_backfill=lambda r: None)
+    assert worker.current_outcome() is None
+    worker._absorb_server_output(SERVER_OUTPUT, started=time.time(), interval_ends=[])
+    now = time.time()
+    assert worker.current_outcome(now + 30)["state"] == udpload.OUTCOME_OK
+    assert worker.current_outcome(now + 75)["state"] == udpload.OUTCOME_OK
+
+
+def test_but_it_does_not_stay_good_for_ever():
+    worker = UdpLoadWorker("10.0.0.1", UPLINK, block_s=10, idle_s=20,
+                           on_backfill=lambda r: None)
+    worker._absorb_server_output(SERVER_OUTPUT, started=time.time(), interval_ends=[])
+    stale = worker.current_outcome(time.time() + 300)
+    assert stale["state"] == udpload.OUTCOME_WARN
+    assert stale["detail"].startswith("no readings for")
+
+
+def test_downlink_goes_stale_in_seconds_because_it_reports_every_second():
+    worker = UdpLoadWorker("10.0.0.1", DOWNLINK)
+    worker._note_ok()
+    now = time.time()
+    assert worker.current_outcome(now + 5)["state"] == udpload.OUTCOME_OK
+    assert worker.current_outcome(now + 30)["state"] == udpload.OUTCOME_WARN
+
+
+def test_a_stream_delivering_nothing_does_not_count_as_working(monkeypatch):
+    """A reverse stream that has stopped delivering still prints a line every
+    second, with no datagrams in it. Those lines must not keep the chip green."""
+    worker = UdpLoadWorker("10.0.0.1", DOWNLINK)
+    script = "printf '%s\\n' \"$0\" \"$0\" \"$0\"; sleep 0.2"
+    monkeypatch.setattr(worker, "build_command", lambda: ["sh", "-c", script, EMPTY_SECOND])
+    monkeypatch.setattr(worker, "build_env", lambda: None)
+    oks = []
+    monkeypatch.setattr(worker, "_note_ok", lambda: oks.append(1))
+    worker._run_stream()
+    assert oks == []
+    # Nor is it a measurement. "0% of nothing was lost" used to be stored as a
+    # loss-free second, in exactly the seconds where nothing got through.
+    assert worker.sample_fields()["udp_down_loss_pct"] is None
+    assert worker._latest is None
+
+    monkeypatch.setattr(worker, "build_command", lambda: ["sh", "-c", script, RECEIVER_LINE])
+    worker._run_stream()
+    assert len(oks) == 3
+
+
+def test_a_new_walk_starts_with_nothing_to_say(monkeypatch):
+    """Carrying the last walk's verdict into this one would show a fault that
+    may be long gone, or sit on top of one that is new."""
+    from viabot_survey.workers.base import Worker
+    monkeypatch.setattr(Worker, "start", lambda self: None)
+    worker = UdpLoadWorker("10.0.0.1", UPLINK)
+    worker._fail_with_reason(SERVER_BUSY, "quiet")
+    assert worker.current_outcome() is not None
+    worker.start()
+    assert worker.current_outcome() is None
+    assert worker.snapshot()["outcome"] is None
+
+
+def test_the_few_words_for_the_phone_lead_with_what_is_wrong():
+    """The chip cuts its text off after a dozen characters, so those have to
+    be the ones that say what happened. What to do about it is read in the
+    alert, which shows the whole sentence."""
+    assert udpload.phone_words("silent", True) == ("server not answering",
+                                                   "Restart the server.")
+    assert udpload.phone_words("busy", False) != udpload.phone_words("busy", True)
+    # Nothing the operator can do about a dead zone, so nothing is asked.
+    assert udpload.phone_words("no_link", False) == ("no link", "")
+
+
+# ---- which seconds the test owns the uplink for ----------------------------
+
+def _run_fake_block(worker, monkeypatch, script):
+    monkeypatch.setattr(worker, "build_command", lambda: ["sh", "-c", script])
+    monkeypatch.setattr(worker, "build_env", lambda: None)
+    states = []
+    real = worker._consume
+
+    def spy(line):
+        result = real(line)
+        states.append((line.strip()[:24], worker.load_state))
+        return result
+    monkeypatch.setattr(worker, "_consume", spy)
+    worker._run_block()
+    return states
+
+
+def test_an_attempt_that_never_starts_does_not_claim_the_uplink(monkeypatch):
+    """A connect that fails puts nothing on the uplink. Marking its seconds as
+    loaded took them out of dead-zone detection in a dead zone, which is the
+    one place the detection is for, and counted every failed handshake as the
+    rig having sent a burst that never arrived."""
+    worker = UdpLoadWorker("10.0.0.1", UPLINK, block_s=10, idle_s=0, settle_s=3)
+    states = _run_fake_block(
+        worker, monkeypatch,
+        "echo 'iperf3: error - unable to connect to server: Connection timed out'")
+    assert [state for _, state in states] == [udpload.LOAD_IDLE]
+    assert worker.load_state == udpload.LOAD_IDLE
+    assert worker.loading is False
+
+
+def test_the_uplink_is_claimed_from_the_moment_the_server_sets_the_test_up(monkeypatch):
+    worker = UdpLoadWorker("10.0.0.1", UPLINK, block_s=10, idle_s=0, settle_s=3,
+                           on_backfill=lambda rows: None)
+    script = ("echo 'Connecting to host 10.0.0.1, port 5201'; "
+              "echo '[  5] local 10.0.0.2 port 40112 connected to 10.0.0.1 port 5201'; "
+              f"echo '{SENDER_LINE}'")
+    states = _run_fake_block(worker, monkeypatch, script)
+    # Read as each line is taken in, so before that line has been acted on:
+    # idle until the server has set the test up, sending from the line after.
+    assert [state for _, state in states] == [
+        udpload.LOAD_IDLE, udpload.LOAD_IDLE, udpload.LOAD_SENDING]
+    # It ended at once, so it is no longer sending, but the buffer it filled
+    # still needs its few seconds to drain.
+    assert worker.load_state == udpload.LOAD_SETTLING
+    assert worker.loading is True
+
+
+def test_a_dead_zone_is_logged_in_words_that_do_not_blame_the_server():
+    """iperf3's own words for a connect that timed out are "server may have
+    stopped running or use a different port, firewall issue". In a dead zone
+    that sends somebody to look at a healthy server."""
+    events = []
+    worker = UdpLoadWorker("10.0.0.1", UPLINK, link_alive=lambda: False,
+                           on_event=lambda level, msg: events.append((level, msg)))
+    worker._fail_with_reason(CONNECT_TIMED_OUT, "quiet")
+    level, message = events[0]
+    assert level == "warning"
+    assert "the server is not the problem" in message
+    assert "server may have stopped running" not in message
+    assert message.endswith("(iperf3: Connection timed out)")
+
+
+def test_iperf3s_own_words_are_kept_where_they_are_the_only_clue():
+    assert udpload.plain_reason("interrupted", _said(STREAM_LOST), "quiet") == (
+        "the test was cut off (iperf3: unable to read from stream socket: "
+        "Resource temporarily unavailable)")
+    # Nothing was said, so there is nothing to translate.
+    assert udpload.plain_reason("no_readings", None, "the server returned no readings") == (
+        "the server returned no readings")
+    # A rejected login keeps its own, longer explanation.
+    assert udpload.plain_reason("auth", "test authorization failed", udpload.AUTH_HINT) == (
+        udpload.AUTH_HINT)

@@ -530,6 +530,17 @@ class Storage:
             (run_id, time.time() if ts is None else ts, level, source, message),
         )
 
+    def run_events(self, run_id: str, limit: int = 2000) -> list[dict]:
+        """Everything logged against one run, oldest first.
+
+        For the report. The event log never leaves the rig, so whatever a
+        reader needs from it has to be put on the page they can actually open.
+        """
+        rows = self.connection().execute(
+            "SELECT * FROM events WHERE run_id = ? ORDER BY ts ASC, id ASC LIMIT ?",
+            (run_id, limit)).fetchall()
+        return [dict(row) for row in rows]
+
     def recent_events(self, limit: int = 50, run_id: str | None = None) -> list[dict]:
         if run_id is None:
             sql = "SELECT * FROM events ORDER BY ts DESC LIMIT ?"

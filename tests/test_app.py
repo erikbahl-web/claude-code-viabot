@@ -120,7 +120,7 @@ def test_status_payload_has_what_the_dashboard_needs(client):
     assert {"ping", "dns", "iperf3", "router", "camera"} <= set(body["workers"])
     # Health is what the operator sees without opening anything, so every
     # subsystem that can silently ruin a walk must be in it.
-    assert {"camera", "link", "power", "disk", "clock"} <= set(body["health"])
+    assert {"camera", "link", "load", "power", "disk", "clock"} <= set(body["health"])
     for item in body["health"].values():
         assert "state" in item and "detail" in item
 
@@ -358,3 +358,22 @@ def test_health_says_when_this_process_started(client):
     assert isinstance(body["started_at"], float)
     # Stable within one process: it is the thing that changes only on restart.
     assert client.get("/api/health").get_json()["started_at"] == body["started_at"]
+
+
+def test_the_phone_draws_every_health_chip_the_rig_reports(client):
+    """A chip the rig reports and the page does not list is simply not drawn,
+    and nothing says so. The load test's chip is the one that would have
+    caught two wasted walks, so it must not be able to vanish quietly."""
+    import re
+    from pathlib import Path
+
+    script = (Path(__file__).resolve().parent.parent
+              / "viabot_survey" / "static" / "app.js").read_text()
+    order = re.search(r"HEALTH_ORDER = \[(.*?)\]", script, re.S).group(1)
+    drawn = set(re.findall(r'"(\w+)"', order))
+    names = re.search(r"HEALTH_NAMES = \{(.*?)\}", script, re.S).group(1)
+    named = set(re.findall(r"(\w+):", names))
+
+    reported = set(client.get("/api/status").get_json()["health"])
+    assert reported == drawn
+    assert drawn <= named

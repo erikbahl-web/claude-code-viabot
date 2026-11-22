@@ -21,9 +21,11 @@
     good: "#22c55e", degraded: "#eab308", bad: "#f97316",
     dead: "#ef4444", unknown: "#64748b"
   };
-  var HEALTH_ORDER = ["camera", "link", "power", "disk", "clock"];
+  // Two rows of three: what is being measured, then the rig itself.
+  var HEALTH_ORDER = ["camera", "link", "load", "power", "disk", "clock"];
   var HEALTH_NAMES = {
-    camera: "Camera", link: "Link", power: "Power", disk: "Disk", clock: "Clock"
+    camera: "Camera", link: "Link", load: "Load test",
+    power: "Power", disk: "Disk", clock: "Clock"
   };
   var RIBBON_SECONDS = 120;
 
