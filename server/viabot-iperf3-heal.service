@@ -1,0 +1,35 @@
+# Restarts a ViaBot iperf3 server that has wedged itself.
+#
+#   sudo systemctl enable --now viabot-iperf3-heal
+#   journalctl -u viabot-iperf3-heal        # every time it has had to step in
+#
+# An iperf3 server can be left spinning in a loop that never ends, accepting
+# connections and answering none of them, by nothing more than a rig losing
+# its link at the wrong moment. On 2026-10-15 that cost two whole walks their
+# uplink data. viabot_iperf_heal.py explains how it happens and how this tells
+# a wedged server from a busy one.
+#
+# It never connects to the iperf3 ports. A connection is what causes the wedge.
+[Unit]
+Description=Restart a wedged iperf3 server for ViaBot coverage surveys
+After=multi-user.target
+
+[Service]
+Type=simple
+# Root, because it restarts other units. It reads /proc and calls systemctl.
+#
+# The script is installed root-owned under /usr/local/lib, NOT beside the
+# receiver in /opt/viabot-receiver. That directory belongs to the unprivileged
+# service account, and a root service that runs a file an unprivileged account
+# can rewrite is a way for anything that breaks into the receiver to become
+# root.
+ExecStart=/usr/bin/python3 /usr/local/lib/viabot/viabot_iperf_heal.py --ports 5201 5202
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

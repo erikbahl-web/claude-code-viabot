@@ -8,6 +8,7 @@
 # Installs and configures both halves:
 #   * the report receiver, behind Caddy with an automatic TLS certificate
 #   * two authenticated iperf3 servers, one per test direction
+#   * a watchdog that restarts an iperf3 server which has wedged itself
 #
 # Idempotent. Re-run it after a repo update and it will leave your secrets
 # alone; pass --rotate-secrets if you actually want new ones.
@@ -136,6 +137,12 @@ ok "authorised user '$VIABOT_IPERF_USER'"
 step "Services"
 install -m 0644 "$SRC/viabot-receiver.service" /etc/systemd/system/
 install -m 0644 "$SRC/viabot-iperf3@.service" /etc/systemd/system/
+# The self-heal runs as root, so it is installed where only root can change
+# it. Not in $APP_DIR: that belongs to the service account, and a root service
+# running a file an unprivileged account can rewrite is a way to become root.
+install -d -m 0755 -o root -g root /usr/local/lib/viabot
+install -m 0755 -o root -g root "$SRC/viabot_iperf_heal.py" /usr/local/lib/viabot/
+install -m 0644 "$SRC/viabot-iperf3-heal.service" /etc/systemd/system/
 systemctl daemon-reload
 # enable, then restart — not `enable --now`, which does nothing at all to a
 # service that is already running. On a re-run after --rotate-secrets that
@@ -147,8 +154,9 @@ systemctl enable viabot-receiver >/dev/null
 # measures both directions at once.
 systemctl enable "viabot-iperf3@$UPLINK_PORT" >/dev/null
 systemctl enable "viabot-iperf3@$DOWNLINK_PORT" >/dev/null
+systemctl enable viabot-iperf3-heal >/dev/null
 systemctl restart viabot-receiver \
-  "viabot-iperf3@$UPLINK_PORT" "viabot-iperf3@$DOWNLINK_PORT"
+  "viabot-iperf3@$UPLINK_PORT" "viabot-iperf3@$DOWNLINK_PORT" viabot-iperf3-heal
 ok "receiver and both iperf3 servers restarted with the current secrets"
 
 # ---------------------------------------------------------------------------
@@ -261,11 +269,16 @@ for port in "$UPLINK_PORT" "$DOWNLINK_PORT"; do
   # blocks the port for two minutes and can take out a whole walk.
   if systemctl show -p ExecStart --value "viabot-iperf3@$port" \
        | grep -q -- "--rcv-timeout"; then
-    ok "iperf3 on $port drops stuck sessions"
+    ok "iperf3 on $port is running the current unit"
   else
-    warn "iperf3 on $port has no --rcv-timeout, so a rig that dies mid-test will block it for 120s"
+    warn "iperf3 on $port is running an older unit; restart it: systemctl restart viabot-iperf3@$port"
   fi
 done
+# Without this a server that wedges stays wedged until somebody notices, and
+# on 2026-10-15 nobody did for two whole walks.
+systemctl is-active --quiet viabot-iperf3-heal \
+  && ok "self-heal is watching both iperf3 servers" \
+  || warn "self-heal is not running: journalctl -u viabot-iperf3-heal -n 20"
 curl -fsS --max-time 5 "http://127.0.0.1:8089/healthz" >/dev/null \
   && ok "receiver answered /healthz" || warn "receiver did not answer locally"
 

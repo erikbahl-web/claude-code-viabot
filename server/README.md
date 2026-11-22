@@ -150,8 +150,9 @@ you about what you are giving up. Prefer a domain.
    only): the upload token, the viewer password and the iperf3 password.
 4. Generates an RSA key pair for iperf3 authentication and builds the
    authorised-users file from the password.
-5. Installs and starts three services: the receiver, and one iperf3 server per
-   test direction.
+5. Installs and starts four services: the receiver, one iperf3 server per
+   test direction, and the self-heal that restarts an iperf3 server which has
+   wedged itself.
 6. Writes a Caddyfile that terminates TLS and proxies to the receiver on
    localhost, with no request body limit so a several-hundred-megabyte video
    chunk is not truncated.
@@ -177,43 +178,94 @@ One iperf3 server runs one test at a time, and a second client is told "the
 server is busy". The rig measures both directions at once, because a teleop
 session is asymmetric and the two halves fail differently, so it needs two.
 
-### Stuck sessions, and why the default is dangerous
+### Stuck sessions: what the timeout does, and what it does not
 
 When a rig's link dies mid-test the server does not find out. It is left
 holding a live TCP control connection that has stopped talking, and until it
 gives up, every later test is refused with "the server is busy running a test".
 
-**iperf3 waits 120 seconds by default.** That is long enough to take a whole
-walk out, and it did. On 2026-09-18 run `aew-test-03` was refused 0.3 seconds
-in, the rig's restart backoff reached its 60-second ceiling within a minute,
-and downlink never ran again for the remaining nine minutes.
+Both instances run with `--rcv-timeout 15000`. **On iperf3 3.16 that value does
+nothing**, and this page used to say otherwise. Measured 2026-11-22 by freezing
+an uplink client mid-test with `SIGSTOP`, so its socket stays open and silent,
+which is what a rig in a dead zone looks like from here:
 
-Both instances therefore run with `--rcv-timeout 15000`, which drops a silent
-session after 15 seconds instead. Measured against 3.16 by freezing a client
-mid-test with `SIGSTOP`, so the socket stays open and goes quiet, which is what
-a rig in a dead zone looks like from here:
+| `--rcv-timeout` | Server busy for |
+|---|---|
+| 8000 | 8.6 s |
+| 9500 | 9.6 s |
+| 10500 | 46.6 s |
+| 15000 | 46.7 s |
+| none | 46.6 s |
 
-| Server | 3 s | 12 s | 25 s |
-|---|---|---|---|
-| No timeouts (the old default) | busy | busy | busy |
-| `--idle-timeout 10` | busy | busy | busy |
-| `--rcv-timeout 8000` | busy | free | free |
+3.16 counts each ten-second empty read as a block received, so a timeout of ten
+seconds or more is never reached. What frees the server at 46 seconds is its
+own end-of-test timer: the test's duration plus forty. The 15-second claim was
+the 8000 measurement, carried over when the value was raised and never taken
+again.
+
+The value is left at 15000 deliberately. 8000 works, but it would also abort a
+real burst that loses eight seconds to a dead zone and then comes back, and the
+rig waits longer than 46 seconds after a failed burst in any case.
 
 **`--idle-timeout` is not the fix**, despite reading as though it should be. It
-covers a server stuck with no connection at all rather than one holding a dead
-test, and it made no difference in the same experiment. Someone will try to
-swap it in.
+covers a server with no connection at all rather than one holding a dead test.
 
-The timeout does not affect downlink, where the server is sending rather than
-receiving. Reverse tests of 30, 45 and 100 seconds all completed cleanly
-against a 15-second timeout.
+**A vanished downlink client is never dropped.** With `-R -t 0` the server is
+the one sending, no timeout applies, and in the same experiment it was still
+transmitting 5 Mbit/s at nobody nineteen minutes later while answering "busy"
+to everyone else. Only a restart ends it. The nightly restart below exists for
+this.
 
-`setup.sh` checks the running process for the flag rather than the file on
-disk, because a stale unit is how this silently fails to take:
+### A server that wedges, and what restarts it
+
+On 2026-10-15 the uplink instance was stuck for two whole walks: every test
+connected, none was answered, and it stayed that way until the box was
+rebooted. It can be reproduced on 3.16:
+
+1. An uplink test completes its handshake, and its single UDP "connect"
+   datagram never arrives. The client then goes silent without closing
+   anything: a link that died as a burst began.
+2. Any other TCP connection reaches the port in the next 15 seconds. The rig's
+   next burst, a port scanner connecting and closing, anything.
+
+The server's main thread then spins in a `select` loop at a full core and never
+answers anyone again. It held for 14.5 minutes before the test was stopped.
+
+`viabot-iperf3-heal.service` restarts an instance in that state within about
+half a minute:
 
 ```bash
-systemctl show -p ExecStart --value viabot-iperf3@5201 | grep -o -- '--rcv-timeout [0-9]*'
+journalctl -u viabot-iperf3-heal       # every time it has stepped in, and why
+systemctl status viabot-iperf3-heal
 ```
+
+How it tells, and the two things not to do to it:
+
+* **It never connects to the iperf3 ports, and nothing that checks on them
+  should.** A connection is step 2. A health probe every thirty seconds would
+  wedge the server it was asking after about half the times a rig lost its link
+  at the start of a burst.
+* **It reads the main thread's CPU, not the process's.** A healthy server
+  sending the downlink stream burns a whole core in a worker thread for the
+  length of every walk, because iperf3 paces UDP in a busy loop. Measured: the
+  main thread sits at 2% while that happens, 0.6% while receiving, and 99% when
+  wedged. Reading the whole process would restart the downlink server in the
+  middle of every test.
+* It does nothing at all on iperf3 older than 3.16, where there is no worker
+  thread and a sending server looks exactly like a wedged one.
+
+It also restarts both instances once a night, at 09:00 UTC, which is the small
+hours on both coasts. That is for the vanished downlink client above, which
+nothing visible from the server distinguishes from a walk in progress.
+
+To clear a stuck server by hand, either of these:
+
+```bash
+systemctl restart viabot-iperf3@5201 viabot-iperf3@5202
+```
+
+or reboot the instance from the provider's control panel, which needs no login
+on the box at all.
 
 ## Pointing a rig at it
 
