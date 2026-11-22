@@ -460,10 +460,10 @@ Every second spent measuring the uplink is a second ping cannot be believed
 about. The schedule went from 10 s on / 20 s off to **20 on / 10 off** because
 the uplink is the robot's video and is the measurement he cares about most:
 uplink is now measured for about 60% of a walk instead of 30%, and dead zones
-are judged from about a quarter of it instead of a half. A dead spot shorter
-than a burst can fall entirely inside one and never be seen by ping. On a
-synthetic walk with one true 25-second dead zone, 10/20 reported it as 19
-seconds and 20/10 as 9. The report's headline caption says how much of the walk
+are judged from about 30% of it instead of 60%. A dead spot shorter than a
+burst can fall entirely inside one and never be seen by ping. On a synthetic
+walk with one true 25-second dead zone, 10/20 reported it as 21 seconds and
+20/10 as 11. The report's headline caption says how much of the walk
 it was judged from, and stops calling it "a fair sample" below half. Do not
 push past 20/10: the windows get too short for a dead zone to last its five
 seconds inside one. More uplink than that needs the uplink readings themselves

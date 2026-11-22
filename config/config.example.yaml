@@ -231,14 +231,14 @@ udp_load:
   # tearing down a burst costs about four seconds a cycle on top:
   #
   #   block / idle    uplink measured    walk judged for dead zones
-  #     10 / 20          about 30%          about 55%
-  #     15 / 15          about 45%          about 40%
-  #     20 / 10          about 60%          about 25 to 30%
+  #     10 / 20          about 30%          about 60%
+  #     15 / 15          about 45%          about 45%
+  #     20 / 10          about 60%          about 30%
   #
   # 20/10 since 2026-11-22, chosen on purpose: the uplink is the robot's
   # video and is the measurement that matters most, and at 10/20 it covered
   # less than a third of every walk. What that costs is real. The headline
-  # percentage is now an estimate from about a quarter of the walk, in
+  # percentage is now an estimate from under a third of the walk, in
   # ten-second windows, and a dead spot shorter than a burst can fall entirely
   # inside one and never be seen by ping at all. Walks before and after this
   # change are not comparable on either number.
