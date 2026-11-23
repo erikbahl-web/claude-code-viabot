@@ -190,10 +190,43 @@ def _absent_reason(direction: str, walked_s: int, block_s: float,
         )
     if direction == "uplink":
         return ("No readings came back from the server. The test runs in "
-                f"{block_s:g}s bursts and asks the far end what arrived; check "
-                "the event log for what the load test said.")
-    return ("The stream never produced a reading. Check the event log for what "
-            "the load test said.")
+                f"{block_s:g}s bursts and asks the far end what arrived, and "
+                "not one of them reported.")
+    return "The stream never produced a reading."
+
+
+#: Levels worth a reader's time. "info" is the rig narrating itself.
+_LOG_LEVELS = ("warning", "error")
+_LOAD_SOURCES = ("udp_up", "udp_down")
+
+
+def run_log(events: Iterable[dict]) -> list[dict]:
+    """What went wrong during a walk, in the rig's own words, oldest first.
+
+    The event log lives in a database on a card in a case, and the published
+    report used to say "check the event log" about a log its reader had no way
+    to open. Two walks on 2026-10-15 came back with no uplink data, and
+    nothing on either page said the server had been stuck throughout.
+
+    Repeats are folded together. A fault that lasts a whole walk is one line
+    with a count and the span it covered, not sixty lines.
+    """
+    rows: list[dict] = []
+    for event in events:
+        level, source = event.get("level"), event.get("source") or ""
+        # The load test announcing that it works again belongs next to the
+        # fault it ends; nothing else at "info" is worth the room.
+        if level not in _LOG_LEVELS and not (level == "info"
+                                             and source in _LOAD_SOURCES):
+            continue
+        last = rows[-1] if rows else None
+        if last and last["source"] == source and last["message"] == event["message"]:
+            last["count"] += 1
+            last["last_ts"] = event["ts"]
+            continue
+        rows.append({"ts": event["ts"], "last_ts": event["ts"], "level": level,
+                     "source": source, "message": event["message"], "count": 1})
+    return rows
 
 
 def _silent_seconds(direction: str, samples: Sequence[dict],
@@ -211,10 +244,44 @@ def _silent_seconds(direction: str, samples: Sequence[dict],
     """
     if direction != "uplink":
         return len(samples) - len(readings)
-    sending = [s for s in samples if s.get("uplink_loaded") == LOAD_SENDING]
-    if not sending:
+    if not any(s.get("uplink_loaded") == LOAD_SENDING for s in samples):
         return len(samples) - len(readings)
-    return sum(1 for s in sending if s.get("udp_up_loss_pct") is None)
+    return sum(1 for sample, sent in zip(samples, uplink_sending(samples))
+               if sent and sample.get("udp_up_loss_pct") is None)
+
+
+def uplink_sending(samples: Sequence[dict]) -> list[bool]:
+    """Which samples were taken during an uplink burst that ran its course.
+
+    A burst the operator cut short is left out. Pause and End stop the test
+    wherever it is, and a burst only reports when it finishes, so one that was
+    interrupted has seconds marked as sending and no readings for them. That
+    is not the link failing: nothing was asked of the server. Counting it put
+    up to a whole burst of "sent, nothing arrived" on every walk that ended
+    mid-burst, which with twenty seconds on and ten off is most of them.
+
+    The same burst lost to the link shortly before a Pause is left out too.
+    The two cannot be told apart from the samples, and under-counting a
+    failure by one burst is the better mistake.
+    """
+    mask = [s.get("uplink_loaded") == LOAD_SENDING for s in samples]
+
+    def paused_after(index: int) -> bool:
+        if index == len(samples) - 1:
+            return True
+        here, after = samples[index].get("ts"), samples[index + 1].get("ts")
+        return here is not None and after is not None and after - here > PAUSE_GAP_S
+
+    for end in range(len(samples)):
+        if not paused_after(end):
+            continue
+        index = end
+        while (index >= 0 and mask[index]
+               and samples[index].get("udp_up_loss_pct") is None
+               and (index == end or not paused_after(index))):
+            mask[index] = False
+            index -= 1
+    return mask
 
 
 def saturation(readings: Sequence[dict], prefix: str, offered_mbps: float | None,
@@ -281,6 +348,7 @@ def load_stats(samples: Sequence[dict],
         offered = parse_bitrate_mbps(config.get(rate_key))
         out[name] = {
             "seconds_measured": len(readings),
+            "measured_pct": round(100.0 * len(readings) / len(samples), 1),
             "seconds_without_stream": _silent_seconds(name, samples, readings),
             "jitter_ms": _spread(_numbers(readings, prefix + "jitter_ms")),
             "loss_pct": _spread(losses),
@@ -289,6 +357,16 @@ def load_stats(samples: Sequence[dict],
             "clean_seconds": sum(1 for v in losses if v == 0),
             **saturation(readings, prefix, offered, below),
         }
+    # How the uplink compares with what one robot actually sends. A reference
+    # line, not a requirement: it is the peak of the one real session anybody
+    # has measured, and nothing has established what the robot can do without.
+    robot = float(config.get("uplink_robot_mbps") or 0)
+    if robot and out["uplink"]["seconds_measured"]:
+        delivered = _numbers(samples, "udp_up_mbps")
+        short = sum(1 for v in delivered if v < robot)
+        out["uplink"].update(
+            robot_mbps=robot, below_robot_seconds=short,
+            below_robot_pct=round(100.0 * short / len(delivered), 1))
     out["seconds_measured"] = max(out["uplink"]["seconds_measured"],
                                   out["downlink"]["seconds_measured"])
     out["uplink_block_s"] = block_s
@@ -476,8 +554,7 @@ def throughput_timeline(samples: Sequence[dict], zones: Sequence[dict] = (),
     # Which columns the rig was actually sending uplink in, so silence it chose
     # is never drawn as silence the garage caused.
     out["uplink_sending"] = _bucket(
-        [1.0 if s.get("uplink_loaded") == LOAD_SENDING else None for s in samples],
-        per)
+        [1.0 if sent else None for sent in uplink_sending(samples)], per)
     out["no_stream"] = _no_stream_spans(out, list(series), out["columns"])
     return out
 
@@ -537,6 +614,7 @@ def build_report(storage: Any, run: dict,
 
     return {
         "run": run,
+        "events": run_log(storage.run_events(run["id"])),
         "summary": stored,
         "sample_count": total,
         "walked_s": stored.get("walked_s", round(total * 1.0, 1)),
@@ -609,6 +687,13 @@ a { color: var(--accent); }
         border-radius: 10px; padding: 12px 16px; margin: 18px 0; }
 .empty { color: var(--muted); background: var(--card); border: 1px solid var(--line);
          border-radius: 10px; padding: 26px; text-align: center; }
+/* The rig's own words. Left-aligned even inside a centred box: they are
+   sentences, some of them long, and centred prose is hard to read. */
+.said { margin: 6px auto 0; padding-left: 20px; max-width: 70ch; text-align: left;
+        font-size: 14px; }
+.said li { margin: 4px 0; }
+td.lv-error { color: var(--bad); }
+td.lv-warning { color: var(--warn); }
 video { width: 100%; border-radius: 10px; background: #000; }
 /* A quarter turn swaps the picture's width and height, but a CSS transform
    does not change the layout box, so the wrapper is resized from script or a
@@ -819,6 +904,50 @@ def _spread_row(label: str, spread: dict | None, unit: str) -> str:
             f'<td class="num">{spread["max"]}{unit}</td></tr>')
 
 
+def _repeats(event: dict) -> str:
+    return (f' <span class="sub">&times;{event["count"]}, last at '
+            f'{_e(clock_time(event["last_ts"]))}</span>'
+            if event.get("count", 1) > 1 else "")
+
+
+def _load_said(events: Sequence[dict], limit: int = 4) -> str:
+    """The load test's own account of itself, for wherever it has no numbers.
+
+    This replaces "check the event log", which named a log on a card in a case
+    in a garage. If the rig logged nothing, that is said too: a silent failure
+    and one nobody recorded are different things to go looking for.
+    """
+    said = [e for e in events
+            if e.get("source") in _LOAD_SOURCES and e.get("level") in _LOG_LEVELS]
+    if not said:
+        return ('<p class="sub">The rig logged nothing from the load test '
+                "during this walk.</p>")
+    items = "".join(
+        f'<li><span class="mono">{_e(clock_time(e["ts"]))}</span> '
+        f'{_e(e["message"])}{_repeats(e)}</li>' for e in said[:limit])
+    more = (f'<p class="sub">and {len(said) - limit} more, under '
+            "&ldquo;What the rig logged&rdquo; below.</p>"
+            if len(said) > limit else "")
+    return ('<p class="sub">What the load test said:</p>'
+            f'<ul class="said">{items}</ul>{more}')
+
+
+def _log_table(events: Sequence[dict]) -> str:
+    if not events:
+        return ('<div class="empty">Nothing. No warnings and no errors were '
+                "logged during this walk.</div>")
+    rows = "".join(
+        f'<tr><td class="mono">{_e(clock_time(e["ts"]))}</td>'
+        f'<td>{_e(e.get("source") or "rig")}</td>'
+        f'<td class="lv-{_e(e.get("level"))}">{_e(e["message"])}{_repeats(e)}</td></tr>'
+        for e in events)
+    return ("<table><thead><tr><th>Time</th><th>From</th><th>What it said</th>"
+            f"</tr></thead><tbody>{rows}</tbody></table>"
+            '<p class="sub">Every warning and error the rig recorded between '
+            "Start and End, in its own words. Times are the rig's local "
+            "clock.</p>")
+
+
 def _grade(pct: float | None) -> str:
     if pct is None:
         return "mid"
@@ -877,17 +1006,39 @@ def render_html(report: dict, *, deadzone_config: dict | None = None,
     when = time.strftime("%A %d %B %Y, %H:%M", time.localtime(started)) if started else ""
 
     # -- headline ------------------------------------------------------------
-    if pct is None:
+    events = report.get("events") or []
+    if pct is None and (summary.get("load_excluded_s") or 0) > 0:
+        # Samples exist; none of them could be judged. Saying "no samples"
+        # here sent somebody looking for a recording fault that was not there.
+        headline = (
+            '<div class="headline"><div class="pct mid">—</div>'
+            '<p class="caption">Too short to judge. All '
+            f'{duration(summary.get("load_excluded_s"))} of this walk fell '
+            "inside the rig's own upload bursts, which are left out because "
+            "ping cannot be trusted while one is on the link. Walk for at "
+            "least a minute.</p></div>")
+    elif pct is None:
         headline = ('<div class="headline"><div class="pct mid">—</div>'
                     '<p class="caption">No samples were recorded for this run.</p></div>')
     else:
         excluded = summary.get("load_excluded_s") or 0
+        judged_s = float(summary.get("judged_s") or 0)
+        share = judged_s / (judged_s + excluded) if judged_s + excluded else 1.0
+        # How far to trust the number depends on how much of the walk it was
+        # taken from, and that is a setting. With long upload bursts it is a
+        # quarter of the walk in short windows, and saying "a fair sample" of
+        # that would be claiming more than the rig measured.
+        fair = ("They are spread evenly across the walk, so this is a fair "
+                "sample of it."
+                if share >= 0.5 else
+                f"That is {share:.0%} of the walk, in the gaps between upload "
+                "bursts. A dead spot shorter than a burst can fall entirely "
+                "inside one and be missed, so read this as an estimate.")
         judged = (
             f' Measured over the {duration(summary.get("judged_s"))} of the walk '
             "when the rig was not loading the uplink itself: the load test "
             "shares the modem's buffer with ping, so those seconds describe the "
-            "test rather than the garage. They are spread evenly across the "
-            "walk, so this is a fair sample of it."
+            f"test rather than the garage. {fair}"
             if excluded else "")
         headline = (
             f'<div class="headline"><div class="pct {_grade(pct)}">{pct:g}%</div>'
@@ -926,8 +1077,22 @@ def render_html(report: dict, *, deadzone_config: dict | None = None,
             f"the roughly {expected}s it should have, which is "
             f"{coverage:g}% of what the burst schedule delivers on a walk this "
             "long. It was failing rather than resting, so the uplink figures "
-            "below describe a fraction of the walk. Check the event log for "
-            "what the test said.")
+            "describe a fraction of the walk. What the load test logged is "
+            "under Detail.")
+    # Anything the rig called an error goes on the first page, in its own
+    # words. A stuck server, a dead camera or a sagging supply each make a walk
+    # worth less than it looks, and none of them shows in the percentage.
+    errors = [e for e in events if e.get("level") == "error"]
+    if errors:
+        quoted = "; ".join(
+            f"\u201c{e['message']}\u201d ({clock_time(e['ts'])}"
+            + (f", \u00d7{e['count']}" if e.get("count", 1) > 1 else "") + ")"
+            for e in errors[:3])
+        more = f" and {len(errors) - 3} more" if len(errors) > 3 else ""
+        warnings.append(
+            f"The rig logged {len(errors)} "
+            f"{'error' if len(errors) == 1 else 'errors'} during this walk: "
+            f"{quoted}{more}. Everything it logged is under Detail.")
     if quality.get("unsynced_clock_samples"):
         warnings.append(
             f"The clock was not synchronised for "
@@ -1052,7 +1217,7 @@ def render_html(report: dict, *, deadzone_config: dict | None = None,
                     f"<h3>{heading}</h3><p class=\"sub\">{blurb}</p>"
                     '<div class="empty"><p>Not measured on this run.</p>'
                     f'<p class="sub">{_e(half.get("absent_reason") or "")}</p>'
-                    "</div>")
+                    f"{_load_said(events)}</div>")
                 continue
             # A link that could not carry what it was offered was *full*, and
             # a full link loses packets because it is full. Saying so next to
@@ -1094,8 +1259,8 @@ def render_html(report: dict, *, deadzone_config: dict | None = None,
         duty = (
             f" Uplink is sent in {block_s:g}-second bursts with {idle_s:g} "
             "seconds of silence between them, so the modem's buffer drains and "
-            "ping spends most of the walk measuring the garage rather than "
-            "queueing behind this test &mdash; so &ldquo;no stream&rdquo; for "
+            "ping gets a stretch of every cycle to measure the garage rather "
+            "than queueing behind this test &mdash; so &ldquo;no stream&rdquo; for "
             "uplink counts only bursts that reached nobody, never the quiet "
             "between them. Downlink runs continuously; it does not compete "
             "for the uplink."
@@ -1118,10 +1283,55 @@ def render_html(report: dict, *, deadzone_config: dict | None = None,
             "and produced no readings at all, in either direction.</p>"
             f'<p class="sub">Uplink: {_e((load.get("uplink") or {}).get("absent_reason") or "")}</p>'
             f'<p class="sub">Downlink: {_e((load.get("downlink") or {}).get("absent_reason") or "")}</p>'
-            '<p class="sub">This says nothing about the garage. Check the '
-            "event log for what the test reported.</p></div>")
+            '<p class="sub">This says nothing about the garage.</p>'
+            f"{_load_said(events)}</div>")
     else:
         load_block = ""
+
+    # -- uplink, on the first page ------------------------------------------
+    #
+    # The percentage above is judged from ping. What decides whether a robot
+    # can work somewhere is whether its video gets out, and that used to be a
+    # section on the second tab that nobody was sent to.
+    up_half = load.get("uplink") or {}
+    if up_half.get("seconds_measured"):
+        rate = up_half.get("mbps") or {}
+        offered_rate = up_half.get("offered_mbps")
+        short_s = up_half.get("below_robot_seconds")
+        uplink_block = (
+            "<h2>Uplink: the robot's video going out</h2>"
+            '<dl class="stats">' + "".join([
+                _stat("Measured", duration(up_half["seconds_measured"])),
+                _stat("Median delivered", f"{rate.get('median', 0):g} Mbit/s"),
+                _stat("Weakest second", f"{rate.get('min', 0):g} Mbit/s"),
+                _stat("Below one robot stream",
+                      f"{short_s}s ({up_half.get('below_robot_pct', 0):g}%)")
+                if short_s is not None else "",
+                _stat("Sent, nothing arrived",
+                      f"{up_half.get('seconds_without_stream', 0)}s"),
+            ]) + "</dl>"
+            f'<p class="sub">Measured for {up_half.get("measured_pct", 0):.0f}% '
+            "of the walk, in bursts, at the far end: this is what the server "
+            "received"
+            + (f" of the {offered_rate:g}&nbsp;Mbit/s the rig offered"
+               if offered_rate else "")
+            + ". "
+            + (f"&ldquo;Below one robot stream&rdquo; counts the measured "
+               f"seconds that delivered less than {up_half['robot_mbps']:g}"
+               "&nbsp;Mbit/s, the peak one robot was measured sending in a real "
+               "teleop session. It is a reference line, not a tested "
+               "requirement. " if short_s is not None else "")
+            + "&ldquo;Sent, nothing arrived&rdquo; is the severe case: the "
+            "link failed badly enough to take the test down. The plot and the "
+            "loss and jitter figures are under Detail.</p>")
+    elif load.get("enabled"):
+        uplink_block = (
+            "<h2>Uplink: the robot's video going out</h2>"
+            '<div class="empty"><p>Not measured on this run.</p>'
+            f'<p class="sub">{_e(up_half.get("absent_reason") or "")}</p>'
+            f"{_load_said(events)}</div>")
+    else:
+        uplink_block = ""
 
     # -- the combined score, and the half of it that is the problem ----------
     score = report.get("radio_score") or {}
@@ -1259,6 +1469,7 @@ def render_html(report: dict, *, deadzone_config: dict | None = None,
   {headline}
   {notes}
   <dl class="stats">{stats}</dl>
+  {uplink_block}
   <h2>Where the link failed</h2>
   {zone_table}
   {clip_player}
@@ -1287,6 +1498,9 @@ def render_html(report: dict, *, deadzone_config: dict | None = None,
   signal than &minus;104.</p>
   {radio_note}
   {throughput_block}
+
+  <h2>What the rig logged</h2>
+  {_log_table(events)}
 </section>
 
 <footer>

@@ -25,6 +25,7 @@ from .storage import Storage
 from .workers import camera as camera_worker
 from .workers import CameraWorker, DnsWorker, Iperf3Worker, PingWorker, RouterWorker
 from .workers.publisher import PublisherWorker
+from .workers import udpload
 from .workers.udpload import DOWNLINK, UPLINK, UdpLoadWorker
 
 log = logging.getLogger(__name__)
@@ -139,6 +140,9 @@ class SurveyRunner:
             password=load["password"],
             public_key_path=load["public_key_path"],
             auth_padding=load["auth_padding"],
+            # Ping is the only witness to whether a server that says nothing
+            # is the server's doing or the garage's.
+            link_quality=self._link_quality,
         )
         self.udp_up = UdpLoadWorker(
             direction=UPLINK,
@@ -214,6 +218,30 @@ class SurveyRunner:
             except Exception:  # noqa: BLE001 - never let logging break a worker
                 log.exception("failed to persist event")
         return handler
+
+    def _link_quality(self) -> str | None:
+        """How ping is doing right now: good, poor or dead. None if unknown.
+
+        Three answers, not two. A link getting one ping in five through is not
+        dead, and it is not a link a test's handshake can be expected to
+        finish over either; only a link this calls good is evidence against
+        the server. Good here means what the banner calls GOOD or DEGRADED.
+
+        Read from the sampler's last reading rather than by asking ping again:
+        this is called once a second from the load test's own threads, and the
+        sample is already there.
+        """
+        if not self.ping.enabled:
+            return None
+        sample = self._last_sample or {}
+        loss = sample.get("loss_pct")
+        if loss is None:
+            return None
+        if loss >= 100:
+            return udpload.LINK_DEAD
+        if sample.get("status") in (STATUS_GOOD, STATUS_DEGRADED):
+            return udpload.LINK_GOOD
+        return udpload.LINK_POOR
 
     def _on_throughput(self, result: dict) -> None:
         with self._lock:
@@ -427,10 +455,17 @@ class SurveyRunner:
         self.storage.replace_dead_zones(run_id, [z.as_dict() for z in zones])
         self.storage.set_run_summary(run_id, summary)
 
-        message = (f"run {run_id}: {summary['runnable_pct']}% runnable, "
-                   f"{summary['dead_zone_count']} dead zone(s)"
-                   if summary["runnable_pct"] is not None
-                   else f"run {run_id}: no samples recorded")
+        if summary["runnable_pct"] is not None:
+            message = (f"run {run_id}: {summary['runnable_pct']}% runnable, "
+                       f"{summary['dead_zone_count']} dead zone(s)")
+        elif samples:
+            # There were samples; none could be judged. "No samples recorded"
+            # here sent somebody looking for a recording fault that was not
+            # there, on a test walk that had simply ended inside a burst.
+            message = (f"run {run_id}: too short to judge. All {len(samples)}s "
+                       "fell inside the rig's own upload bursts")
+        else:
+            message = f"run {run_id}: no samples recorded"
         self.storage.add_event(message, source="runner", run_id=run_id)
         self._wrapup = {"run_id": run_id, "summary": summary,
                         "zones": [z.as_dict() for z in zones]}
@@ -839,13 +874,68 @@ class SurveyRunner:
         else:
             clock_state, clock_detail = "fail", "NOT synced — timestamps unreliable"
 
+        try:
+            load_state, load_detail = self._load_health(run_active)
+        except Exception:  # noqa: BLE001 - this feeds the phone's only screen
+            log.exception("could not work out the load test's health")
+            load_state, load_detail = "unknown", "not readable"
+
         return {
             "camera": {"state": camera_state, "detail": camera_detail},
             "link": {"state": link_state, "detail": link_detail},
+            "load": {"state": load_state, "detail": load_detail},
             "power": {"state": power_state, "detail": power_detail},
             "disk": {"state": disk_state, "detail": disk_detail},
             "clock": {"state": clock_state, "detail": clock_detail},
         }
+
+    def _load_health(self, run_active: bool) -> tuple[str, str]:
+        """Whether the load test is measuring, and whose problem it is if not.
+
+        Not link quality; the banner says that. This is the failure the
+        banner cannot show. On 2026-10-15 the server's uplink service was
+        stuck for two whole walks, every other reading on this screen looked
+        healthy, and both walks came back with no uplink data at all.
+
+        A fault here goes red and raises the full-width alert, like the
+        camera does, because the walk is being wasted in the same way. A dead
+        zone only ever goes amber: it takes the test down too, and that is the
+        garage's doing, which is what the walk is there to find.
+        """
+        workers = [w for w in self.udp_load if w.enabled]
+        if not workers:
+            return "off", "disabled in config"
+        if not run_active:
+            return "idle", "runs during a walk"
+        now = time.time()
+        order = ("ok", "warn", "fail")
+        worst, waiting = "ok", False
+        wrong: dict[str, list[str]] = {}
+        advice: list[str] = []
+        for worker in workers:
+            outcome = worker.current_outcome(now)
+            if outcome is None:
+                waiting = True
+                continue
+            if outcome["state"] != "ok":
+                side = "uplink" if worker.direction == UPLINK else "downlink"
+                wrong.setdefault(outcome["detail"], []).append(side)
+                if outcome.get("advice") and outcome["advice"] not in advice:
+                    advice.append(outcome["advice"])
+            if order.index(outcome["state"]) > order.index(worst):
+                worst = outcome["state"]
+        if worst != "ok":
+            # What is wrong comes first, because the chip shows only the first
+            # fifteen characters or so; which direction and what to do about
+            # it are read in the alert, which shows all of it.
+            said = "; ".join(f"{what} ({', '.join(sides)})"
+                             for what, sides in wrong.items())
+            return worst, " ".join([said + "." if advice else said, *advice])
+        if waiting:
+            # Uplink only reports when a burst ends, so the first ten seconds
+            # of every walk have nothing to show yet. Grey, not green.
+            return "idle", "first test running"
+        return "ok", "measuring"
 
     def history(self, seconds: float = 180) -> list[dict]:
         """Recent samples for the sparkline. Falls back to the live reading when

@@ -193,6 +193,13 @@ udp_load:
   # Mbit/s" without disturbing a survey, use:
   #     ./scripts/capacity_test.sh --udp 5M
   uplink_bitrate: 3M
+  # What one robot was MEASURED sending at its peak, in Mbit/s (764 kbit/s,
+  # 2026-09-12, see above). The report counts the uplink seconds that
+  # delivered less than this. It is a reference line and nothing more: it
+  # does not decide what counts as a dead zone, and nobody has established
+  # what the robot can do without. Change it when a second session is
+  # measured, not to make a report look better.
+  uplink_robot_mbps: 0.764
 
   # --- the duty cycle, and why the uplink test is not continuous -----------
   # The rate above is offered, not guaranteed, and the modem holds a deep
@@ -215,15 +222,41 @@ udp_load:
   #                  buffer does not empty the instant the sender stops.
   #
   # Seconds inside a burst, and the settling seconds after it, are recorded
-  # with uplink_loaded = 1 and left out of dead-zone detection entirely — they
-  # describe the test, not the place. At 10/20 that leaves about two thirds of
-  # the walk judging the garage, spread evenly across it.
+  # in uplink_loaded and left out of dead-zone detection entirely — they
+  # describe the test, not the place.
+  #
+  # So these two numbers are one trade, and there is no setting that wins
+  # both halves of it. Every second spent measuring the uplink is a second
+  # ping cannot be believed about, and the other way round. Setting up and
+  # tearing down a burst costs about four seconds a cycle on top:
+  #
+  #   block / idle    uplink measured    walk judged for dead zones
+  #     10 / 20          about 30%          about 60%
+  #     15 / 15          about 45%          about 45%
+  #     20 / 10          about 60%          about 30%
+  #
+  # 20/10 since 2026-11-22, chosen on purpose: the uplink is the robot's
+  # video and is the measurement that matters most, and at 10/20 it covered
+  # less than a third of every walk. What that costs is real. The headline
+  # percentage is now an estimate from under a third of the walk, in
+  # ten-second windows, and a dead spot shorter than a burst can fall entirely
+  # inside one and never be seen by ping at all. Walks before and after this
+  # change are not comparable on either number.
+  #
+  # Do not go further. Past 20/10 the windows are too short for a dead zone
+  # to last its five seconds inside one. More uplink than this needs the
+  # uplink readings themselves to count as dead-zone evidence, which is a
+  # different detector and needs a threshold nobody has set.
   #
   # A burst still has to be long enough to be worth establishing: the block is
   # what the far end reports on, and the walk has to outlast one whole cycle
   # (block + idle) before any uplink number exists at all.
-  uplink_block_s: 10
-  uplink_idle_s: 20
+  #
+  # If a rig keeps its old schedule after an update, its own config.yaml is
+  # setting these two keys and wins over this file. The report says which
+  # schedule a walk actually used, under "Under a teleop-sized load".
+  uplink_block_s: 20
+  uplink_idle_s: 10
   uplink_settle_s: 3
 
   # A block that delivered less than this fraction of uplink_bitrate did not

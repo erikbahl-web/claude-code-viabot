@@ -119,8 +119,9 @@ shares it. The result is latency the garage did not cause.
 
 That happened. A walk at a spot with good signal came back 42.3% runnable.
 
-So the uplink test now sends for `uplink_block_s` (10 s) and then stays quiet for
-`uplink_idle_s` (20 s). Seconds inside a burst, plus `uplink_settle_s` (3 s)
+So the uplink test now sends for `uplink_block_s` (20 s) and then stays quiet for
+`uplink_idle_s` (10 s). It was 10 and 20 until 2026-11-22; the trade between the
+two is written out beside the settings in `config/config.example.yaml`. Seconds inside a burst, plus `uplink_settle_s` (3 s)
 after one while the buffer drains, are recorded in `samples.uplink_loaded` and
 dropped from dead-zone detection entirely. They are dropped rather than counted
 as good, the same way paused seconds are, and the report prints both `walked_s`
@@ -232,7 +233,7 @@ every hardware fact in this repo came from someone pasting terminal output.
 ## Checking it yourself
 
 ```bash
-.venv/bin/python -m pytest        # 316 tests, no hardware needed
+.venv/bin/python -m pytest        # about 400 tests, no hardware needed
 ```
 
 Workers are tested through their parsing and command-building functions rather

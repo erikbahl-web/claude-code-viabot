@@ -20,33 +20,48 @@ Wants=network-online.target
 Type=simple
 User=viabot
 Group=viabot
-# --rcv-timeout is the one that matters, and the default is the problem.
+# What --rcv-timeout does here, measured, because the first account of it in
+# this file was wrong.
 #
 # One iperf3 server runs one test at a time. When a rig's link dies mid-test
 # the server never learns the client has gone: it is left holding a live TCP
-# control connection that has simply stopped talking. Until it gives up, every
-# later test gets "the server is busy running a test. try again later".
+# control connection that has simply stopped talking, and every later test
+# gets "the server is busy running a test. try again later".
 #
-# The default it gives up after is 120 seconds. That took run aew-test-03 out
-# entirely on 2026-09-18: downlink was refused 0.3 s into the walk, the
-# restart backoff reached its 60 s ceiling within a minute, and the direction
-# never ran again for the remaining nine minutes.
+# Measured 2026-11-22 against 3.16, freezing an uplink client mid-test with
+# SIGSTOP so its socket stays open and silent, which is what a rig in a dead
+# zone looks like, then timing how long the server stays busy:
 #
-# Measured against 3.16, freezing a client mid-test with SIGSTOP so the socket
-# stays open and silent, which is what a rig in a dead zone looks like:
+#   --rcv-timeout 8000     8.6 s
+#   --rcv-timeout 9500     9.6 s
+#   --rcv-timeout 10500   46.6 s
+#   --rcv-timeout 15000   46.7 s
+#   no flag at all        46.6 s
 #
-#   no timeouts         still busy at 3 s, 12 s and 25 s
-#   --rcv-timeout 8000  busy at 3 s, free by 12 s
+# So values of ten seconds and over do nothing on 3.16: it counts each
+# ten-second empty read as a block received and never reaches the timeout.
+# What frees the server at 46 s is its own end-of-test timer, the test's
+# duration plus forty seconds. This file used to say 15000 freed it in 15 s.
+# That figure was the 8000 measurement, carried over when the value was raised
+# and never taken again.
 #
-# --idle-timeout does NOT do this, despite reading as though it should. It
-# covers a server stuck with no connection at all, not one holding a dead
-# test, and it made no difference in the same experiment. Do not swap it in.
+# The value is left at 15000 on purpose. 8000 does work, but it would also
+# abort a real burst that loses eight seconds to a dead zone and then comes
+# back, throwing away the seconds either side that did arrive. The rig waits
+# longer than 46 s after a failed burst anyway.
 #
-# 15 s is chosen to sit above any silence inside a legitimate 10 s uplink
-# burst and well below the 30 s cycle, so the server is free again before the
-# rig comes back. Reverse (downlink) tests are unaffected because the server
-# is sending rather than receiving: 30 s, 45 s and 100 s reverse runs all
-# completed against a 15 s timeout.
+# Two things this flag does NOT protect against, both found the same day:
+#
+#   * A vanished *downlink* client (-R -t 0) is never dropped. The server went
+#     on transmitting at nobody, and answering "busy", for nineteen minutes
+#     until the test was stopped. Nothing but a restart ends it.
+#   * The server can wedge outright: an uplink test whose first UDP datagram
+#     never arrives, followed by any other connection to the port, leaves the
+#     main thread spinning for good. viabot-iperf3-heal.service exists for
+#     that, and restarts every instance once a night for the one above.
+#
+# --idle-timeout does not help with any of this, despite reading as though it
+# should. It covers a server with no connection at all. Do not swap it in.
 ExecStart=/usr/bin/iperf3 --server --port %i \
   --rcv-timeout 15000 \
   --rsa-private-key-path /etc/viabot/iperf3_private.pem \

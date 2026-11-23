@@ -166,7 +166,12 @@ class PingWorker(Worker):
     def snapshot(self, now: float | None = None) -> dict[str, Any]:
         now = time.time() if now is None else now
         cutoff = now - self.window_s
-        window = [e for e in self._results.values() if e["ts"] >= cutoff]
+        # Copied in one step before it is looked through. The ping thread adds
+        # to this while the sampler and every status request read it, and
+        # reading it in a loop raised "OrderedDict mutated during iteration"
+        # about once in two minutes on a busy machine, costing a sample or a
+        # status reply each time.
+        window = [e for e in list(self._results.values()) if e["ts"] >= cutoff]
         rtts = [e["rtt"] for e in window if e["rtt"] is not None]
 
         loss_pct: float | None = None

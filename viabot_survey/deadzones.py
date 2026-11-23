@@ -228,9 +228,10 @@ def summarise(samples: Sequence[dict], zones: Sequence[DeadZone],
     ``samples`` is what :func:`measurable` left: the seconds the rig's own
     uplink load was not sitting in the modem's buffer. ``loaded_s`` is how many
     it took out, so the report can still say how long the walk really was and
-    how much of it was judged. The percentage is of the judged part — an
-    estimate from more than half the walk, spread evenly across it, which
-    is a fair sample of a walk at a steady pace.
+    how much of it was judged. The percentage is of the judged part, which
+    is spread evenly across the walk. How much of the walk that is depends on
+    the burst schedule: over half at 10 s on / 20 off, about a quarter at
+    20 / 10. The report says which, and how far to trust it.
     """
     total = len(samples)
     dead_samples = sum(zone.sample_count for zone in zones)

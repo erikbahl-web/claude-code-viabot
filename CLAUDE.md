@@ -63,8 +63,11 @@ and stops it alongside the camera, for the same reasons.
 **`udp_load` bitrates are a compromise, and the uplink one has a hard ceiling
 above it.** A live Formant teleop session on 2026-09-12 sent **645 kbit/s mean,
 764 peak** robot-to-operator and **64 kbit/s mean, 104 peak** the other way:
-one robot, one camera, 37 seconds. Against that, 5 Mbit/s up has been quoted for
-teleop from memory, unsourced. `uplink_bitrate: 3M` splits them: ~4.6x the
+one robot, one camera, 37 seconds. Against that, 5 Mbit/s up was quoted for
+teleop from memory. It turns out to be Formant's own documented minimum upload
+for *one 720p stream* (360p is 1, 480p is 2.5, 1080p is 8; "System
+requirements", read 2026-11-22), so it is a provisioning table and says nothing
+about what this robot is configured to send. `uplink_bitrate: 3M` splits them: ~4.6x the
 measured session, and about two thirds of this link's own measured uplink
 ceiling of **4.48 Mbit/s** (2026-09-17, good signal).
 
@@ -99,6 +102,89 @@ lines apart. Always parse the server's own per-second log
 (`--get-server-output` + `parse_server_output`), the way `udpload` does; use
 `end.sum` only when there is no server output, and say on the page that it is
 the sender's number.
+
+**A server that says nothing is not a dead zone, and only ping can tell them
+apart.** On 2026-10-15 the server's uplink iperf3 instance was stuck for two
+whole walks. The rig logged "the test stopped responding" once a minute, which
+is also what a dead zone looks like, and both walks came back with no uplink
+data. A wedged server and a dead link print the *same nothing*: not even
+"Connecting to host", which iperf3 only prints after the server's first reply.
+Two things separate them, and both have to stay:
+
+- `--connect-timeout` (`CONNECT_TIMEOUT_MS`) makes a connect into a dead link
+  end by itself with "unable to connect". Without it that connect is silent for
+  as long as the kernel retries. With it, silence that lasts until the watchdog
+  means the connection was *made* and the server never spoke.
+- `SurveyRunner._link_quality` is ping, sampled every second of the attempt,
+  and it gives three answers, not two: good (what the banner calls GOOD or
+  DEGRADED), poor, or dead. Silent with the link **good** for 80% of it is the
+  server (`silent`, red, "restart the server"). Dead is the place. Poor is
+  also the place, and this is the one that is easy to get wrong.
+
+**"Not dead" is not "good", and only good counts against the server.** iperf3
+prints nothing at all until its first interval line, a second into the test,
+so silence means only that the handshake never finished. On a link getting one
+ping in five through, a handshake can spend a quarter of a minute in TCP
+retries and then lose the single datagram that starts the test, and four SYNs
+in ten seconds can all go missing. The first version of this called the link
+"alive" whenever ping loss was under 100% and would have told an operator to
+restart a healthy server in exactly the marginal places a survey is for, then
+quoted that in a report that cannot be corrected. A review caught it before it
+shipped. Anything short of a clean link is amber: "no answer from the server"
+or "link too weak for the test".
+
+Verified 2026-11-22 against a 3.16 server wedged for real, on loopback. The
+rig's own client is 3.18 and was only read as source: that the flag exists there
+and that "Connecting to host" is printed at the same point.
+
+**Load-test trouble only becomes a fault when it lasts** (`ESCALATE_AFTER_S`).
+A dead zone takes the load test down too, and that is the garage's doing, so
+`no_link`, `weak_link`, `interrupted` and `no_readings` never go red however
+long they go on. `busy` gets two minutes, because a server legitimately answers
+"busy" for 46.6 s after any rig vanishes mid-test. `unreachable` gets a minute:
+three failed connects in a row on a clean link. Each kind's clock runs from
+when it was first seen until something *works*, not until the next different
+failure and not until the next Pause. A server stuck on a dead test answers
+"busy" between dead zones for a whole walk, and a clock that restarted at every
+dead zone would never reach two minutes. A chip that goes red in every dead zone
+trains its operator to stop reading it, and then it is worth nothing on the day
+the server really is stuck.
+
+**The iperf3 server can be wedged for good, and a second connection is what
+does it.** Reproduced 2026-11-22 on 3.16: when the single UDP "connect"
+datagram of a test never arrives and the client's control socket then goes
+silent (a link that died as a burst began), the server waits in
+`CREATE_STREAMS`. Any *other* TCP connection to that port before the receive
+timeout ends that wait (15 s with the unit's flag, 120 s without) sends it into
+a `select` loop at 99% of a core. It held for 14.5 minutes and never freed
+itself; only the dead client's socket closing, or a restart, ends it. A port
+scanner's connect-and-close is enough to be that second connection. So:
+
+- **Never add a health check that connects to the iperf3 ports.** A probe is
+  the trigger, not the cure. `server/viabot_iperf_heal.py` reads CPU time
+  instead, which needs no connection.
+- **It reads the main thread's CPU, never the process's.** A healthy server
+  sending the downlink stream burns a whole core in a worker thread for the
+  length of every walk, because iperf3 paces UDP in a busy loop. Measured: main
+  thread 2% while sending, 0.6% while receiving, 99% wedged. Whole-process CPU
+  would restart the downlink server mid-test, every walk. For the same reason
+  the provider's CPU graph only means anything *between* walks.
+- The fix on the day is a restart. Rebooting the server from the hosting
+  dashboard works without the root password.
+- That this is what happened on 2026-10-15 is *inferred*. Nobody looked at the
+  server before it was rebooted.
+
+**`--rcv-timeout 15000` does nothing on iperf3 3.16.** Measured 2026-11-22 with
+a frozen uplink client: 8000 frees the server in 8.6 s and 9500 in 9.6 s, but
+10500, 15000 and the default all take 46.6 s, because 3.16 counts each ten-second
+empty read as a block received and so never reaches a timeout of ten seconds or
+more. What actually frees it is the server's own end-of-test timer, the test's
+duration plus 40 s. The unit file's comment says 15 s; that was never
+re-measured after the value was raised from the 8000 that had been tested. It
+is left alone for now, because 8000 would also abort a real burst that loses
+eight seconds to a dead zone and comes back. A vanished *downlink* client
+(`-R -t 0`) is worse: the server is never freed at all, and was still
+transmitting 5 Mbit/s at nobody nineteen minutes later.
 
 **The modem holds the buffer, not the router.** Measured 2026-09-18: offered 12
 Mbit/s up, and the router's `4G-LTE` transmit counter showed 12,530 kbit/s
@@ -147,9 +233,9 @@ discarding it means driving back to the garage.
 
 **A walk shorter than one uplink cycle measures no uplink at all.** Uplink loss
 is only countable at the far end, so the rig sends a fixed burst
-(`uplink_block_s`, 10 s) and then asks the server what arrived. A burst cut
+(`uplink_block_s`, 20 s) and then asks the server what arrived. A burst cut
 short by the run ending reports nothing, and the burst is followed by
-`uplink_idle_s` (20 s) of silence, so the walk has to outlast the whole cycle.
+`uplink_idle_s` (10 s) of silence, so the walk has to outlast the whole cycle.
 A 23-second test walk therefore has a full downlink trace and no uplink
 whatsoever, and the report used to drop the section rather than say so. It now
 says why. The same applies to the tail of every real walk: up to one burst's
@@ -168,7 +254,27 @@ build, and a gap long enough that it drains.
 
 Seconds inside a burst, and `uplink_settle_s` after it, are written to
 `samples.uplink_loaded` (2 sending, 1 settling) and **excluded from dead-zone
-detection entirely** by `deadzones.measurable()`. They are dropped from the
+detection entirely** by `deadzones.measurable()`. A burst begins when the
+server has set the test up (the "connected to" line), not when iperf3 is
+launched: an attempt that never gets that far puts nothing on the uplink, and
+marking it loaded took its seconds out of dead-zone detection inside dead
+zones, the one place detection is for. It also counted every handshake as a
+second in which the rig "sent and nothing arrived".
+
+Three details of that bookkeeping exist because a real link is not loopback:
+
+- iperf3 says nothing until the first interval is over, so the first sample of
+  every burst is written before anything shows the burst has begun. The
+  reading that comes back for it stamps `uplink_loaded` on it afterwards.
+- The last interval line of every burst only arrives once the end-of-test
+  exchange has gone round. Readings are therefore placed from the *earliest*
+  estimate of when the burst began (each line says how far in it ends; lines
+  can be late and never early), not each by its own line's arrival. Timing them
+  individually left one second per burst marked "sent" with nothing on it.
+- A burst cut short by Pause or End has sending marks and no readings, because
+  nothing was ever asked of the server. `report.uplink_sending()` leaves it out
+  of "sent, nothing arrived" and of the grey shading on the plot. With twenty
+  seconds on and ten off, End lands inside a burst most of the time. They are dropped from the
 percentage rather than counted as good, exactly as paused seconds are, and the
 report prints both `walked_s` and `judged_s`. Three things follow that are easy
 to break:
@@ -293,6 +399,26 @@ class: the tab script selects `.tabs [data-tab]` now, but it used to select
 report, killing everything later in the script while the page still looked
 right.
 
+**The report quotes the rig; it never sends the reader to it.** The event log
+lives in a database on a card in a case. The published page used to say "check
+the event log" to a reader with no way of opening it, which is how two walks
+with no uplink data came back with nothing on the page saying why.
+`report.run_log()` puts every warning and error logged between Start and End
+onto the page, repeats folded into one line with a count, and anything at
+error level is quoted on the first tab. A test asserts the words "event log"
+never appear in a rendered report. Keep it that way for anything new the
+report cannot explain from its own numbers.
+
+**The load test has its own chip, and it is about the test, not the link.**
+Green means readings are arriving, amber means the place took the test down,
+red means a fault walking on will not fix, and red raises the full-width alert
+exactly as a dead camera does, because the walk is being wasted in the same
+way. Each direction keeps its last finished attempt, so the chip does not
+blink back to "unknown" between bursts. There are six chips now, in two rows
+of three: a chip the rig reports and `app.js` does not list is simply not
+drawn, and `test_the_phone_draws_every_health_chip_the_rig_reports` exists so
+that cannot happen quietly.
+
 **Camera failure must be impossible to miss.** A rig whose camera has died is
 still cheerfully reporting connection quality, and the entire walk is wasted.
 It gets a health chip *and* a full-width alert.
@@ -325,10 +451,24 @@ server; keep it that way, because nothing else catches this class of bug.
 **Enabling `udp_load` moves the headline number.** Dead zones are detected from
 ping, which shares the uplink with the load test. Since 2026-09-18 the loaded
 seconds are excluded rather than judged, so the percentage is an estimate from
-roughly two thirds of the walk rather than all of it. Still a fair sample at a
-steady pace, but not the same measurement. Runs from before and after are not
+part of the walk rather than all of it. Runs from before and after are not
 comparable, and the thresholds were conceived for an idle link. See
 `docs/UNVERIFIED.md`.
+
+**The burst schedule is one trade, and Erik chose which way on 2026-11-22.**
+Every second spent measuring the uplink is a second ping cannot be believed
+about. The schedule went from 10 s on / 20 s off to **20 on / 10 off** because
+the uplink is the robot's video and is the measurement he cares about most:
+uplink is now measured for about 60% of a walk instead of 30%, and dead zones
+are judged from about 30% of it instead of 60%. A dead spot shorter than a
+burst can fall entirely inside one and never be seen by ping. On a synthetic
+walk with one true 25-second dead zone, 10/20 reported it as 21 seconds and
+20/10 as 11. The report's headline caption says how much of the walk
+it was judged from, and stops calling it "a fair sample" below half. Do not
+push past 20/10: the windows get too short for a dead zone to last its five
+seconds inside one. More uplink than that needs the uplink readings themselves
+to count as dead-zone evidence, which is a different detector with a threshold
+nobody has set. Walks from before and after the change are not comparable.
 
 **Pause means "this time did not happen".** It stops measuring and recording
 both, so paused seconds leave no samples and no video. That is what makes the
@@ -350,6 +490,7 @@ indoor positioning. Do not make Pause merely cosmetic.
 | `viabot_survey/publish.py` | Resumable upload client; the receiver's byte count is the authority |
 | `viabot_survey/storage.py` | SQLite; add columns to `SAMPLE_COLUMNS` when extending `samples` |
 | `server/viabot_receiver.py` | The cloud side: accepts uploads, serves reports. Deployed separately, not on the rig |
+| `server/viabot_iperf_heal.py` | Restarts an iperf3 server that has wedged itself, and both of them once a night. Runs as root on the server, installed outside the service account's directory |
 | `viabot_survey/router_client.py` | Modem stats. `AtOverSshRouterClient` is the one that works here: SSH to the router, AT to the modem. `normalize_signal` matches field names across firmwares for the HTTP clients |
 | `scripts/setup.sh`, `setup_ap.sh` | Provisioning; both idempotent, both re-runnable |
 | `scripts/thermal_test.sh` | Does the closed case cook the Pi? Decodes `get_throttled`, which is where the answer actually lives |
@@ -363,7 +504,7 @@ example file is what makes it exist. A user's older local config still boots.
 ## Testing
 
 ```bash
-.venv/bin/python -m pytest        # 316 tests, no camera or rig needed
+.venv/bin/python -m pytest        # about 400 tests, no camera or rig needed
 ```
 
 Most of the suite runs anywhere: workers are tested through their parsing and
@@ -393,6 +534,14 @@ The rig now runs: the access point comes up, the captive portal fires, a run
 starts and ends, the camera records with a burned-in clock, and clips are cut.
 
 Specifically open:
+
+- **Whether the rig can stop guessing and simply run Formant.** Agreed in
+  principle 2026-11-22: Formant's agent on the Pi as its own device, a second
+  USB camera for it, and a bot on the server that opens the rig the way an
+  operator would and logs every frame. Nothing is built. The first step is a
+  bench proof that a Pi 4B can run the agent beside the survey's own recording.
+  See `docs/UNVERIFIED.md` for what was read from Formant's documentation and
+  what is still only believed.
 
 - Which SMA port is MAIN and which is DIV on the field router. Ports `a` and `c`
   are the two that produced working readings and the pair is in use, but the

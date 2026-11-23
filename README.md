@@ -152,7 +152,7 @@ config/config.example.yaml   every setting, documented inline
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pytest
-.venv/bin/python -m pytest        # 316 tests, no camera or rig needed
+.venv/bin/python -m pytest        # about 400 tests, no camera or rig needed
 
 # Run the app locally without the captive portal hijacking your browser:
 .venv/bin/python -m viabot_survey --port 8080 --no-captive-portal

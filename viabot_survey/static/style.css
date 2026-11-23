@@ -57,7 +57,10 @@ html, body {
 
 /* ---- health strip ---- */
 
-.health { display: flex; gap: 7px; }
+/* Three to a row. Six chips in one row left each about seven characters wide
+   on a phone, which cut "recording" and "measuring" off mid-word; and the
+   load test's chip has to be able to say "server not answering". */
+.health { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
 .chip {
   flex: 1;
   background: var(--panel);

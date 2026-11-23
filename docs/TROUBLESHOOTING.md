@@ -100,7 +100,27 @@ Ethernet link is down.
 ## The load test is not producing readings
 
 The report says "Not measured on this run", or the uplink section is missing.
-Check the event log first, because the reason is almost always written there.
+The report now quotes what the load test logged, on the first tab and in full
+under "What the rig logged", so start there. During a walk the **Load test**
+chip on the phone says the same thing as it happens:
+
+| Chip | Means | Do |
+|---|---|---|
+| grey, "first test running" | Uplink only reports when a burst ends, so the first seconds of a walk have nothing yet | Wait for it to turn green or red before walking off |
+| green, "measuring" | Readings are arriving in both directions | Nothing |
+| amber, "no link" or "test cut off" | A dead zone took the test down with it | Nothing. That is what the walk is for |
+| amber, "link too weak for the test" or "no answer from the server" | The link is there but patchy, and the test could not get started over it | Nothing. A patchy link is never blamed on the server |
+| amber, "connected, nothing arriving" | The downlink stream is up and delivering nothing | Nothing. It picks up by itself when the link returns |
+| amber, "nothing yet after ..." | A direction has not managed one result since Start or Resume | Wait a burst or two; if it stays, look at what the report quotes |
+| amber, "server busy with another test" | Normal for up to a minute after any dead zone | Nothing unless it turns red |
+| red, "server not answering" | The test connected and heard nothing back for 45 s while ping was clean. The server's test service is stuck | Restart the server. Rebooting it from the hosting dashboard works without the root password |
+| red, "server stuck on a dead test" | It has answered "busy" for over two minutes | Restart the server |
+| red, "server rejected the login" | Password, clock or iperf3 version. See below | |
+| red, "cannot reach the server, though the link is up" | The server is down, or its address or firewall changed | Check the server is running |
+
+**A quick check before a walk:** start a throwaway run, wait until the chip
+turns green or red (about a minute at worst), then End it. A stuck server shows
+red there, in the car park, rather than in the report afterwards.
 
 **"test authorization failed"** has three causes and the message is identical
 for all of them:
@@ -122,9 +142,12 @@ The real reason for a padding mismatch appears only in the server's own log, as
 open on that port. When a rig's link dies mid-test the server never learns the
 client has gone, and until it gives up every later test is refused.
 
-Since 2026-09-21 both instances run with `--rcv-timeout 15000`, so a silent
-session is dropped after 15 seconds instead of the 120 the default allows. If
-you are still seeing this, check the running process rather than the file:
+Since 2026-09-21 both instances run with `--rcv-timeout 15000`. Measured
+2026-11-22, that value does nothing on iperf3 3.16: a vanished *uplink* client
+holds the port for 46.6 seconds whatever the flag says (the server's own
+end-of-test timer), and a vanished *downlink* client holds it until the service
+is restarted. So "busy" for a minute after a dead zone is normal, and "busy" for
+minutes is a test nobody is on the other end of. To see what is running:
 
 ```bash
 systemctl show -p ExecStart --value viabot-iperf3@5201 | grep -o -- '--rcv-timeout [0-9]*'
@@ -140,11 +163,17 @@ To clear one by hand in the meantime:
 sudo systemctl restart viabot-iperf3@5201 viabot-iperf3@5202
 ```
 
-**Silence from `udp_up` with almost no `uplink_loaded` seconds** used to mean a
-hung test that took the rest of the walk with it and logged nothing. A watchdog
-now kills a test after 45 seconds of silence, so look for "the test stopped
-responding and was restarted" in the event log. Seeing that repeatedly is a
-link problem rather than a rig problem.
+**"The test connected to the server and then heard nothing back"** is a stuck
+server, not a bad garage. The rig only says it when ping was getting through
+*cleanly* for the whole silence, so the link was demonstrably good. On a patchy
+link it says "no answer from the server" instead and blames nobody. On 2026-10-15 this went on
+for two whole walks. Restart the server; the chip goes green within a burst or
+two of it coming back, and the log says "working again".
+
+The same silence with ping dead is reported as **"no answer from the server ...
+There is no link here"**, and a test that had started and then went quiet as
+**"the test went quiet part-way through"**. Both are the garage. Neither is
+anything to fix.
 
 ## The camera is not recording
 
