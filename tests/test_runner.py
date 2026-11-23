@@ -431,7 +431,7 @@ def _store_bursts(storage, run_id, rates, base=None, block=10, idle=20):
 
 
 def test_the_summary_says_where_the_uplink_fell_short(runner, storage):
-    _store_bursts(storage, "r1", [2.9, None, 0.5, 2.8])
+    _store_bursts(storage, "r1", [2.9, None, 0.5, 1.4])
     summary = runner.analyse_run("r1")["summary"]
     found = summary["uplink_spots"]
     assert found["bursts"] == 4
@@ -511,7 +511,7 @@ def test_the_worst_uplink_bursts_get_real_clips_that_do_not_collide(runner, stor
 
     base = float(int(time.time()) - 600)
     runner.config._data["udp_load"]["uplink_spot_clips"] = 2
-    _store_bursts(storage, "r1", [None, 0.5, 1.0, 2.9], base=base, block=5, idle=5)
+    _store_bursts(storage, "r1", [None, 0.5, 0.3, 2.9], base=base, block=5, idle=5)
     video = runner.config.video_dir / "r1"
     video.mkdir(parents=True)
     name = time.strftime("%Y%m%dT%H%M%SZ.mkv", time.gmtime(base - 5))
@@ -527,7 +527,7 @@ def test_the_worst_uplink_bursts_get_real_clips_that_do_not_collide(runner, stor
     assert [s["worst_rank"] for s in clipped] == [1, 2]
     assert all(Path(s["clip_path"]).name.startswith("uplink-") for s in clipped)
     assert all(Path(s["clip_path"]).stat().st_size > 0 for s in clipped)
-    assert not spots[2].get("clip_path")        # the third worst: over the cap
+    assert not spots[1].get("clip_path")        # 0.5, the third worst: over the cap
 
 
 # ---- the chip's numbers, and the schedule on the phone ----------------------
@@ -561,3 +561,46 @@ def test_the_phone_is_told_the_burst_schedule_in_force(runner, monkeypatch):
     assert runner.status()["uplink_schedule"] is None      # off in the fixture
     runner.udp_up.enabled = True
     assert runner.status()["uplink_schedule"] == {"on_s": 20.0, "off_s": 10.0}
+
+
+def test_no_second_clip_is_cut_where_a_dead_zone_already_has_one(runner, storage,
+                                                                monkeypatch):
+    """Silent bursts mostly sit inside dead zones. The cap is spent on places
+    ping did not flag, worst first."""
+    _store_bursts(storage, "r1", [None, 0.5, 0.3])
+    samples = list(storage.iter_samples("r1"))
+    zone = {"index": 1, "start_ts": samples[0]["ts"], "end_ts": samples[9]["ts"],
+            "clip_path": "/d/deadzone-01.mp4"}
+    runner.config._data["udp_load"]["uplink_spot_clips"] = 1
+    cut = []
+
+    def fake_extract(stretch, *args, **kwargs):
+        cut.append((stretch.start_ts, stretch.end_ts, args[3]["pre_roll_s"]))
+        stretch.clip_path = f"/d/uplink-{stretch.index:02d}.mp4"
+        return stretch
+    monkeypatch.setattr("viabot_survey.runner.deadzones.extract_clip", fake_extract)
+    found = runner._uplink_spots("r1", samples, runner.config.video_dir / "r1",
+                                 [("seg.mkv", 0.0)], [zone])
+    spots = found["spots"]
+    assert spots[0]["dead_zone"] == 1 and not spots[0].get("clip_path")
+    assert [s.get("clip_path") for s in spots[1:]] == [None, "/d/uplink-03.mp4"]
+    assert len(cut) == 1
+
+
+def test_an_uplink_clip_window_never_exceeds_a_minute(runner, storage, monkeypatch):
+    """Whatever the data says. Every clip is cut on the Pi and uploaded over
+    cellular; an hour-long one blocked a re-analysis for minutes."""
+    _store_bursts(storage, "r1", [None], block=90, idle=5)
+    runner.config._data["deadzone"]["pre_roll_s"] = 300
+    windows = []
+
+    def fake_extract(stretch, segments, video_dir, out, config, **kwargs):
+        windows.append(stretch.clip_window(config["pre_roll_s"],
+                                           config["post_roll_s"]))
+        return stretch
+    monkeypatch.setattr("viabot_survey.runner.deadzones.extract_clip", fake_extract)
+    runner._uplink_spots("r1", list(storage.iter_samples("r1")),
+                         runner.config.video_dir / "r1", [("seg.mkv", 0.0)])
+    assert len(windows) == 1
+    start, end = windows[0]
+    assert end - start <= 61

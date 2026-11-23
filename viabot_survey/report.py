@@ -435,18 +435,34 @@ def uplink_bursts(samples: Sequence[dict]) -> list[dict[str, Any]]:
     return bursts
 
 
-def uplink_spots(samples: Sequence[dict],
-                 load_config: dict | None = None) -> dict[str, Any]:
-    """Where in the walk the uplink fell short of what it was offered.
+def longest_burst_s(load_config: dict | None = None) -> float:
+    """The longest stretch that can honestly be one uplink burst.
 
-    The first page used to give the uplink's totals and nothing about *where*,
-    and the uplink is the robot's video. A burst falls short if it never
-    reported, or if its median delivered rate was below
-    ``uplink_saturated_below`` times the offered rate: the same setting the
-    report already uses to call a second saturated, on purpose, so there is
-    no second threshold to argue about. Those below one robot's measured
-    stream are flagged as well, since that is the reference line the page
-    already quotes.
+    Runs recorded before 2026-09-18 tested the uplink continuously, so the
+    whole walk reads as a single "burst". Re-analysing one used to try to
+    list it and cut an hour-long clip of it.
+    """
+    block_s = float((load_config or {}).get("uplink_block_s") or 20)
+    return max(3 * block_s, 90.0)
+
+
+def uplink_spots(samples: Sequence[dict], load_config: dict | None = None,
+                 zones: Sequence[dict] = ()) -> dict[str, Any]:
+    """Where in the walk the uplink could not carry one robot stream.
+
+    A burst is listed if it never reported, or if its median delivered rate
+    was below ``uplink_robot_mbps``: the peak of the one real teleop session
+    measured. Not the 0.85 x offered saturation line: on this rig's link a
+    3 Mbit/s burst usually delivers 1.3 to 1.6, so that line listed nearly
+    every burst of every walk and said nothing about where. With no robot
+    rate set, only bursts that never reported are listed.
+
+    A burst longer than :func:`longest_burst_s` is not a burst but an old
+    continuous test, and is ignored entirely.
+
+    ``zones`` are the walk's dead zones. A spot overlapping one that already
+    has footage is marked with it, so the page can link that clip rather
+    than cut a second one of the same place.
 
     ``worst_rank`` orders them for choosing which get footage: never reported
     first, then lowest median. The list itself stays in time order, which is
@@ -454,22 +470,26 @@ def uplink_spots(samples: Sequence[dict],
     """
     config = load_config or {}
     offered = parse_bitrate_mbps(config.get("uplink_bitrate"))
-    below = float(config.get("uplink_saturated_below") or 0.85)
     robot = float(config.get("uplink_robot_mbps") or 0)
-    bursts = uplink_bursts(samples)
-    floor = offered * below if offered else None
+    longest = longest_burst_s(config)
+    every = uplink_bursts(samples)
+    bursts = [b for b in every if b["seconds"] <= longest]
 
     spots = []
     for burst in bursts:
         median = burst["median_mbps"]
-        short = (not burst["reported"]
-                 or (floor is not None and median < floor)
-                 or (bool(robot) and median < robot))
-        if not short:
+        below_robot = bool(robot) and median is not None and median < robot
+        if burst["reported"] and not below_robot:
             continue
-        spots.append(dict(burst,
-                          below_robot=bool(robot) and median is not None
-                          and median < robot))
+        spot = dict(burst, below_robot=below_robot)
+        for zone in zones:
+            if (zone.get("clip_path") and zone.get("start_ts") is not None
+                    and zone["start_ts"] <= burst["end_ts"]
+                    and burst["start_ts"] <= zone.get("end_ts", zone["start_ts"])):
+                spot["dead_zone"] = zone.get("index") or zone.get("idx")
+                spot["dead_zone_clip"] = zone["clip_path"]
+                break
+        spots.append(spot)
     ranked = sorted(range(len(spots)), key=lambda i: (
         spots[i]["reported"], spots[i]["median_mbps"] or 0.0,
         spots[i]["start_ts"]))
@@ -479,8 +499,8 @@ def uplink_spots(samples: Sequence[dict],
         spot["index"] = index
     return {
         "bursts": len(bursts),
+        "ignored_long": len(every) - len(bursts),
         "offered_mbps": round(offered, 3) if offered else None,
-        "below": below,
         "robot_mbps": robot or None,
         "spots": spots,
     }
@@ -1072,22 +1092,35 @@ def _clip_link(item: dict, pre_roll: float, post_roll: float,
 
 def _uplink_spot_block(found: dict | None, pre_roll: float,
                        post_roll: float) -> str:
-    """Where the uplink fell short, worst first for footage, in time order.
+    """Where the uplink could not carry one robot stream, in time order.
 
     Only ever called when the uplink was measured. Absent data (a run
-    analysed before this existed) draws nothing rather than "none fell short",
-    which would be a claim nobody checked.
+    analysed before this existed) draws nothing rather than "none", which
+    would be a claim nobody checked.
     """
     if not found or not isinstance(found.get("spots"), list):
         return ""
     spots = found["spots"]
     offered = found.get("offered_mbps")
-    heading = "<h3>Where the uplink fell short</h3>"
+    robot = found.get("robot_mbps")
+    bursts = int(found.get("bursts") or 0)
+    heading = "<h3>Where the uplink could not carry one robot stream</h3>"
+    line = (f'<p class="sub">The line is {robot:g}&nbsp;Mbit/s, the peak of the '
+            "one real teleop session measured: a reference, not a tested "
+            "requirement. A burst is listed when its median fell below it, or "
+            "when nothing it sent arrived at all.</p>" if robot else
+            '<p class="sub">No robot stream rate is set on the rig, so only '
+            "bursts where nothing arrived at all are listed.</p>")
+    ignored = int(found.get("ignored_long") or 0)
+    if ignored:
+        line += (f'<p class="sub">{ignored} stretch'
+                 f'{"" if ignored == 1 else "es"} of continuous uplink testing '
+                 "were left out: that is how runs were recorded before the "
+                 "test ran in bursts, and it cannot be placed in the walk.</p>")
     if not spots:
-        return (heading + '<p class="sub">None of the '
-                f'{int(found.get("bursts") or 0)} uplink bursts fell short'
-                + (f" of the {offered:g}&nbsp;Mbit/s offered" if offered else "")
-                + ".</p>")
+        return (heading + f'<p class="sub">None of the {bursts} uplink bursts '
+                "fell below one robot stream, and every one of them "
+                "reported.</p>" + line)
     shown = sorted(sorted(spots, key=lambda s: s.get("worst_rank") or 0)
                    [:UPLINK_SPOT_ROWS], key=lambda s: s.get("start_ts") or 0)
     rows = []
@@ -1101,41 +1134,32 @@ def _uplink_spot_block(found: dict | None, pre_roll: float,
             got += (f" of {offered:g}" if offered else "") + " Mbit/s"
         else:
             got = "none" + (f" of {offered:g} Mbit/s" if offered else "")
-        if not spot.get("reported"):
-            note = "sent, nothing arrived"
-        elif spot.get("below_robot"):
-            note = "below one robot stream"
+        note = ("sent, nothing arrived" if not spot.get("reported")
+                else "below one robot stream")
+        if spot.get("dead_zone_clip"):
+            # Ping already flagged this place and its clip shows it. A second
+            # clip of the same spot would only cost the upload.
+            note += f"; same place as dead zone {spot.get('dead_zone')}"
+            footage = _clip_link({"clip_path": spot["dead_zone_clip"]},
+                                 pre_roll, post_roll)
         else:
-            note = ""
+            footage = _clip_link(spot, pre_roll, post_roll, "no clip cut")
         rows.append(
             f'<tr><td class="mono">{_e(clock_time(spot.get("start_ts")))}</td>'
             f'<td class="num">{_e(duration(spot.get("seconds")))}</td>'
             f'<td class="num">{_e(got)}</td><td>{_e(note)}</td>'
-            f'<td>{_clip_link(spot, pre_roll, post_roll, "no clip cut")}</td></tr>')
+            f"<td>{footage}</td></tr>")
     hidden = len(spots) - len(shown)
-    clipped = sum(1 for s in spots if isinstance(s, dict) and s.get("clip_path"))
-    more = (f'<p class="sub">{hidden} more fell short and are not listed; '
-            f"these are the {len(shown)} worst.</p>" if hidden > 0 else "")
-    below = found.get("below")
-    rule = (f"A burst is listed when it never reported, or when the median it "
-            f"delivered was below {below:g}&times; the {offered:g}&nbsp;Mbit/s "
-            "offered: the same line the report uses to call a second "
-            "saturated." if offered and below else
-            "A burst is listed when it never reported.")
-    robot = found.get("robot_mbps")
-    robot_note = (f" &ldquo;Below one robot stream&rdquo; means under "
-                  f"{robot:g}&nbsp;Mbit/s, the peak one robot was measured "
-                  "sending." if robot else "")
+    more = (f'<p class="sub">{hidden} more are not listed; these are the '
+            f"{len(shown)} worst.</p>" if hidden > 0 else "")
     return (heading
-            + f'<p class="sub">{len(spots)} of the {int(found.get("bursts") or 0)} '
-            "uplink bursts fell short."
-            + (f" Footage was cut for the {clipped} worst." if clipped else "")
-            + "</p>"
+            + f'<p class="sub">{len(spots)} of the {bursts} uplink bursts.</p>'
             '<table><thead><tr><th>Started</th><th class="num">Lasted</th>'
             '<th class="num">Delivered</th><th>Note</th><th>Footage</th>'
             f"</tr></thead><tbody>{''.join(rows)}</tbody></table>{more}"
-            f'<p class="sub">{rule}{robot_note} Times are the rig\'s local '
-            "clock, the same one burned into the video.</p>")
+            + line
+            + '<p class="sub">Times are the rig\'s local clock, the same one '
+            "burned into the video.</p>")
 
 
 def _dead_zone_rows(zones: Sequence[dict], pre_roll: float, post_roll: float) -> str:

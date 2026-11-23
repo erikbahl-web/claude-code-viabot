@@ -40,6 +40,8 @@ STATUS_UNKNOWN = "unknown"
 STATUS_ORDER = (STATUS_DEAD, STATUS_BAD, STATUS_DEGRADED, STATUS_GOOD, STATUS_UNKNOWN)
 
 SAMPLE_INTERVAL_S = 1.0
+#: The longest an uplink clip's window may be, rolls included, in seconds.
+UPLINK_CLIP_MAX_S = 60.0
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -456,7 +458,8 @@ class SurveyRunner:
         # fail it: a walk whose uplink table could not be built still has its
         # dead zones, its headline and its report.
         try:
-            spots = self._uplink_spots(run_id, samples, video_dir, segments)
+            spots = self._uplink_spots(run_id, samples, video_dir, segments,
+                                       [z.as_dict() for z in zones])
             if spots is not None:
                 summary["uplink_spots"] = spots
         except Exception as exc:  # noqa: BLE001 - must never cost the walk
@@ -493,19 +496,23 @@ class SurveyRunner:
         return self._wrapup
 
     def _uplink_spots(self, run_id: str, samples: list, video_dir: Path,
-                      segments: list) -> dict | None:
-        """Find the uplink bursts that fell short, and cut footage of the worst.
+                      segments: list, zones: list = ()) -> dict | None:
+        """Find where the uplink could not carry one robot stream, and cut
+        footage of the worst places ping did not already flag.
 
         None when the run has no uplink bursts at all, which is every run with
-        the load test switched off: there is nothing to say, and saying "none
-        fell short" would claim a measurement that never happened.
+        the load test switched off: there is nothing to say, and saying "none"
+        would claim a measurement that never happened.
         """
-        found = report.uplink_spots(samples, self.config["udp_load"])
+        found = report.uplink_spots(samples, self.config["udp_load"], zones)
         if not found["bursts"]:
             return None
         spots = found["spots"]
         limit = max(0, int(self.config["udp_load"].get("uplink_spot_clips") or 0))
-        worst = sorted(spots, key=lambda s: s["worst_rank"])[:limit]
+        # A spot inside a dead zone that already has a clip is that clip; the
+        # cap goes on places only the uplink test saw.
+        worst = sorted((s for s in spots if not s.get("dead_zone_clip")),
+                       key=lambda s: s["worst_rank"])[:limit]
         config = self.config["deadzone"]
         if worst and config.get("extract_clips", True) and segments:
             clip_dir = Path(self.config.data_dir) / "clips" / run_id
@@ -513,12 +520,19 @@ class SurveyRunner:
             self.storage.add_event(
                 f"cutting {len(worst)} clip(s) where the uplink fell short",
                 source="runner", run_id=run_id)
+            pre = float(config.get("pre_roll_s", 10))
+            post = float(config.get("post_roll_s", 5))
+            # Whatever the data says, never more than about a minute of
+            # footage: every clip is cut on the Pi and sent over cellular.
+            longest = max(0.0, UPLINK_CLIP_MAX_S - pre - post - deadzones.SAMPLE_S)
             for spot in worst:
-                stretch = deadzones.DeadZone(index=spot["index"],
-                                             start_ts=spot["start_ts"],
-                                             end_ts=spot["end_ts"])
+                stretch = deadzones.DeadZone(
+                    index=spot["index"], start_ts=spot["start_ts"],
+                    end_ts=min(spot["end_ts"], spot["start_ts"] + longest))
+                clip_config = dict(config, pre_roll_s=min(pre, UPLINK_CLIP_MAX_S / 2),
+                                   post_roll_s=min(post, UPLINK_CLIP_MAX_S / 2))
                 deadzones.extract_clip(
-                    stretch, segments, video_dir, clip_dir, config,
+                    stretch, segments, video_dir, clip_dir, clip_config,
                     segment_length_s=float(self.config["camera"]["segment_s"]),
                     container=container, name_prefix="uplink",
                     what="uplink burst")
