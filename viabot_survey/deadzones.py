@@ -306,8 +306,15 @@ def plan_clip(segments: Sequence[tuple[str, float]], video_dir: Path,
 def extract_clip(zone: DeadZone, segments: Sequence[tuple[str, float]],
                  video_dir: Path, output_dir: Path, config: dict,
                  segment_length_s: float = 300.0,
-                 container: str = "mp4") -> DeadZone:
-    """Cut the footage for one dead zone. Mutates and returns the zone."""
+                 container: str = "mp4", name_prefix: str = "deadzone",
+                 what: str = "dead zone") -> DeadZone:
+    """Cut the footage for one dead zone. Mutates and returns the zone.
+
+    Also cuts the uplink's weak bursts, which are not dead zones but want the
+    same footage around them. ``name_prefix`` keeps their files from
+    colliding with dead-zone clips of the same number in the same directory,
+    and ``what`` is what an error message calls the stretch.
+    """
     if shutil.which("ffmpeg") is None:
         zone.clip_error = "ffmpeg not installed"
         return zone
@@ -318,11 +325,11 @@ def extract_clip(zone: DeadZone, segments: Sequence[tuple[str, float]],
 
     spans = plan_clip(segments, video_dir, window_start, window_end, segment_length_s)
     if not spans:
-        zone.clip_error = "no video covers this dead zone"
+        zone.clip_error = f"no video covers this {what}"
         return zone
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    name = (f"deadzone-{zone.index:02d}-"
+    name = (f"{name_prefix}-{zone.index:02d}-"
             f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(zone.start_ts))}-"
             f"{int(zone.duration_s)}s.{container}")
     output = output_dir / name

@@ -198,7 +198,15 @@
     }
   }
 
-  function renderSystem(system) {
+  // The burst schedule the rig is actually running, so the operator can see
+  // from here that an update took effect. null means the uplink test is off.
+  function scheduleText(schedule) {
+    if (schedule === undefined) return null;
+    if (!schedule) return "off";
+    return schedule.on_s + " s on / " + schedule.off_s + " s off";
+  }
+
+  function renderSystem(system, schedule) {
     if (!system) return;
     var rows = [
       ["Hostname", system.hostname],
@@ -208,6 +216,8 @@
       ["CPU temp", system.cpu_temp_c === null ? "—" : system.cpu_temp_c + " °C"],
       ["Uptime", clock(system.uptime_s)]
     ];
+    var uplinkTest = scheduleText(schedule);
+    if (uplinkTest !== null) rows.push(["Uplink test", uplinkTest]);
     if (system.timezone_info) {
       rows.push(["Timezone", (system.timezone_info.configured ||
                               system.timezone_info.name) +
@@ -248,7 +258,7 @@
       renderHealth(data.health);
       renderBanner(data.sample || {});
       renderRun(data);
-      renderSystem(data.system);
+      renderSystem(data.system, data.uplink_schedule);
       el("provisionalNote").hidden = !data.thresholds_provisional;
     }).catch(function () {
       consecutiveFailures += 1;

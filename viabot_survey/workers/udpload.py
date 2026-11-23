@@ -497,6 +497,9 @@ class UdpLoadWorker(Worker):
         # kind -> (first seen, last seen), for every kind of trouble met since
         # anything last worked.
         self._trouble_since: dict[str, tuple[float, float]] = {}
+        # The median the server received over the last finished uplink
+        # burst, for the phone's chip.
+        self._burst_median_mbps: float | None = None
         # When this worker was last started, so that a direction which never
         # reports at all does not sit on "first test running" for a whole walk.
         self._started_at: float | None = None
@@ -800,6 +803,7 @@ class UdpLoadWorker(Worker):
             self._outcome = None
             self._last_reason = None
             self._started_at = time.time()
+            self._burst_median_mbps = None
         super().start()
 
     def _run_stream(self) -> None:
@@ -999,6 +1003,10 @@ class UdpLoadWorker(Worker):
 
         self._latest = readings[-1]
         self._latest_ts = time.time()
+        rates = sorted(r["mbps"] for r in readings)
+        middle = len(rates) // 2
+        self._burst_median_mbps = (rates[middle] if len(rates) % 2
+                                   else (rates[middle - 1] + rates[middle]) / 2)
         self._backfilled += len(backfill)
         if self._on_backfill:
             self._on_backfill(backfill)
@@ -1104,6 +1112,20 @@ class UdpLoadWorker(Worker):
             loss: self._latest["loss_pct"],
             mbps: round(self._latest["mbps"], 3),
         }
+
+    def headline_mbps(self, now: float | None = None) -> float | None:
+        """One number for what this direction is delivering, or None.
+
+        Uplink: the median of the last finished burst, since that is the only
+        time the far end tells us anything. Downlink: the latest second, while
+        it is still fresh enough to be called current.
+        """
+        if self.direction == UPLINK:
+            return self._burst_median_mbps
+        now = time.time() if now is None else now
+        if self._latest is None or now - self._latest_ts > STALE_AFTER_S:
+            return None
+        return self._latest.get("mbps")
 
     def snapshot(self) -> dict[str, Any]:
         return {

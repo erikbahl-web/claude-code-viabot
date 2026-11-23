@@ -267,6 +267,16 @@ udp_load:
   # when it happens over most of a walk.
   uplink_saturated_below: 0.85
 
+  # The report's first page lists the uplink bursts that fell short: those
+  # that never reported, and those whose median delivered less than
+  # uplink_saturated_below x uplink_bitrate (the same line as above, not a
+  # new one). The worst of them get a video clip, never-reported first, then
+  # lowest median. This caps how many. Every clip is cut on the Pi while the
+  # operator waits at the end of a walk, and uploaded over the same cellular
+  # link afterwards, so a garage where every burst fell short must not turn
+  # into a hundred clips. 0 lists them without cutting any footage.
+  uplink_spot_clips: 6
+
   # --- downlink: the operator's commands, coming in ------------------------
   # Small, but if it collapses the robot stops taking orders. The rig is the
   # receiving end here, so these readings arrive live, once a second.

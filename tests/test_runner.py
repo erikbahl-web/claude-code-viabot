@@ -407,3 +407,157 @@ def test_a_walk_that_ended_inside_a_burst_is_logged_as_too_short(runner, storage
     said = [e["message"] for e in storage.recent_events(run_id=run_id)]
     assert any("too short to judge" in message for message in said)
     assert not any("no samples recorded" in message for message in said)
+
+
+# ---- where the uplink fell short --------------------------------------------
+
+def _store_bursts(storage, run_id, rates, base=None, block=10, idle=20):
+    """One stored uplink burst per entry: its delivered rate, or None."""
+    base = base or time.time() - 600
+    storage.create_run(run_id, label="Level 2", started_at=base)
+    ts = base
+    for rate in rates:
+        for _ in range(block):
+            fields = {} if rate is None else {
+                "udp_up_mbps": rate, "udp_up_loss_pct": 1.0, "udp_up_jitter_ms": 3.0}
+            storage.add_sample(run_id, ts, rtt_ms=45.0, loss_pct=0.0, status="good",
+                               uplink_loaded=2, **fields)
+            ts += 1
+        for _ in range(idle):
+            storage.add_sample(run_id, ts, rtt_ms=45.0, loss_pct=0.0, status="good",
+                               uplink_loaded=0)
+            ts += 1
+    return base
+
+
+def test_the_summary_says_where_the_uplink_fell_short(runner, storage):
+    _store_bursts(storage, "r1", [2.9, None, 0.5, 2.8])
+    summary = runner.analyse_run("r1")["summary"]
+    found = summary["uplink_spots"]
+    assert found["bursts"] == 4
+    assert [s["median_mbps"] for s in found["spots"]] == [None, 0.5]
+    # And it is stored, so the report built later reads the same thing.
+    import json
+    stored = json.loads(storage.get_run("r1")["summary_json"])
+    assert stored["uplink_spots"]["bursts"] == 4
+
+
+def test_a_walk_without_the_load_test_has_no_uplink_spots(runner, storage):
+    """Saying "none fell short" would claim a measurement nobody made."""
+    storage.create_run("r1", label="Level 2")
+    storage.add_sample("r1", time.time(), rtt_ms=45.0, loss_pct=0.0, status="good")
+    assert "uplink_spots" not in runner.analyse_run("r1")["summary"]
+
+
+def test_a_failing_uplink_step_never_costs_the_walk(runner, storage, monkeypatch):
+    """Hard requirement. Dead zones, summary, report and publishing all go
+    ahead exactly as before, and the failure is said once."""
+    base = time.time() - 600
+    storage.create_run("r1", label="Level 2", started_at=base)
+    for offset in range(100):
+        dead = 40 <= offset < 70
+        storage.add_sample("r1", base + offset, rtt_ms=None if dead else 45.0,
+                           loss_pct=100.0 if dead else 0.0,
+                           status="dead" if dead else "good")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("synthetic")
+    monkeypatch.setattr("viabot_survey.runner.report.uplink_spots", boom)
+    queued = []
+    monkeypatch.setattr(runner, "queue_for_publishing", queued.append)
+
+    result = runner.analyse_run("r1")
+    assert result["summary"]["dead_zone_count"] == 1
+    assert "uplink_spots" not in result["summary"]
+    assert storage.get_run("r1")["runnable_pct"] == 70.0
+    assert len(storage.list_dead_zones("r1")) == 1
+    assert queued == ["r1"]
+    warnings = [e for e in storage.recent_events(run_id="r1")
+                if "uplink fell short" in e["message"]]
+    assert len(warnings) == 1 and warnings[0]["level"] == "warning"
+
+
+def test_uplink_clips_are_published_beside_the_dead_zone_clips(runner, storage,
+                                                               tmp_path, monkeypatch):
+    _store_bursts(storage, "r1", [None, 2.9])
+    clip = tmp_path / "uplink-01-x-10s.mp4"
+    clip.write_bytes(b"x" * 100)
+    runner.analyse_run("r1")                    # publishing is off here
+    runner.config._data["publish"]["enabled"] = True
+    import json
+    run = storage.get_run("r1")
+    summary = json.loads(run["summary_json"])
+    summary["uplink_spots"]["spots"][0]["clip_path"] = str(clip)
+    storage.set_run_summary("r1", summary)
+
+    queued = []
+    monkeypatch.setattr(storage, "enqueue_upload",
+                        lambda run_id, kind, path, name, size, **kw:
+                        queued.append((kind, name)))
+    runner.queue_for_publishing("r1")
+    assert ("clip", "clips/uplink-01-x-10s.mp4") in queued
+
+
+requires_ffmpeg = __import__("pytest").mark.skipif(
+    __import__("shutil").which("ffmpeg") is None, reason="ffmpeg is not installed")
+
+
+@requires_ffmpeg
+def test_the_worst_uplink_bursts_get_real_clips_that_do_not_collide(runner, storage):
+    """Cut through the same machinery as dead-zone clips, named so the two can
+    share a directory, and capped so a bad garage cannot become a hundred."""
+    import subprocess
+    from pathlib import Path
+
+    base = float(int(time.time()) - 600)
+    runner.config._data["udp_load"]["uplink_spot_clips"] = 2
+    _store_bursts(storage, "r1", [None, 0.5, 1.0, 2.9], base=base, block=5, idle=5)
+    video = runner.config.video_dir / "r1"
+    video.mkdir(parents=True)
+    name = time.strftime("%Y%m%dT%H%M%SZ.mkv", time.gmtime(base - 5))
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "testsrc=size=160x90:rate=5", "-t", "60",
+         "-c:v", "libx264", "-preset", "ultrafast", "-g", "10",
+         "-pix_fmt", "yuv420p", str(video / name)], check=True, capture_output=True)
+    runner.config._data["camera"]["segment_s"] = 60
+
+    spots = runner.analyse_run("r1")["summary"]["uplink_spots"]["spots"]
+    clipped = [s for s in spots if s.get("clip_path")]
+    assert [s["worst_rank"] for s in clipped] == [1, 2]
+    assert all(Path(s["clip_path"]).name.startswith("uplink-") for s in clipped)
+    assert all(Path(s["clip_path"]).stat().st_size > 0 for s in clipped)
+    assert not spots[2].get("clip_path")        # the third worst: over the cap
+
+
+# ---- the chip's numbers, and the schedule on the phone ----------------------
+
+def test_a_healthy_chip_shows_the_numbers_not_a_word(runner, monkeypatch):
+    _with_load_test(runner, monkeypatch).start_run(label="Level 2")
+    runner.udp_up._absorb_server_output(
+        "Server output:\n" + "\n".join(
+            f"[  5] {i}.00-{i + 1}.00 sec  {rate} KBytes  {rate * 8 / 1000:.2f} Mbits/sec"
+            f"  1.0 ms  0/100 (0%)" for i, rate in enumerate([350, 362, 380])),
+        time.time(), [])
+    runner.udp_down._latest = {"mbps": 4.98, "loss_pct": 0.0}
+    runner.udp_down._latest_ts = time.time()
+    runner.udp_down._note_ok()
+    detail = runner.health()["load"]["detail"]
+    assert detail == "↑2.9 ↓5.0 Mbit/s"
+    assert len(detail) <= 16
+
+
+def test_the_chip_shows_one_direction_when_only_one_has_a_number(runner, monkeypatch):
+    _with_load_test(runner, monkeypatch).start_run(label="Level 2")
+    for worker in runner.udp_load:
+        _outcome(worker, "ok")
+    runner.udp_down._latest = {"mbps": 5.0, "loss_pct": 0.0}
+    runner.udp_down._latest_ts = time.time()
+    assert runner.health()["load"] == {"state": "ok", "detail": "↓5.0 Mbit/s"}
+
+
+def test_the_phone_is_told_the_burst_schedule_in_force(runner, monkeypatch):
+    """So the owner can confirm from the phone that an update took effect."""
+    assert runner.status()["uplink_schedule"] is None      # off in the fixture
+    runner.udp_up.enabled = True
+    assert runner.status()["uplink_schedule"] == {"on_s": 20.0, "off_s": 10.0}

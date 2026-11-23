@@ -470,6 +470,24 @@ seconds inside one. More uplink than that needs the uplink readings themselves
 to count as dead-zone evidence, which is a different detector with a threshold
 nobody has set. Walks from before and after the change are not comparable.
 
+**The report says where the uplink fell short, and shows it.** After a walk
+is analysed, `report.uplink_spots()` splits the samples into uplink bursts and
+lists the ones that never reported (sent during a burst that ran its course,
+per `uplink_sending()`, with no reading) or whose median delivered rate was
+below `uplink_saturated_below` times `uplink_bitrate`. That is the existing
+saturation line on purpose; do not invent a second threshold for it. Bursts
+under `uplink_robot_mbps` are marked "below one robot stream". The worst get a
+clip (never-reported first, then lowest median), named `uplink-NN-...` so they
+cannot collide with dead-zone clips, capped by `udp_load.uplink_spot_clips`
+because each is cut on the Pi and uploaded over cellular. The result lives in
+`summary["uplink_spots"]`, not in a table, and is drawn under the uplink block
+on the first tab. **This step must never cost the walk**: `analyse_run` wraps
+it so any exception logs one warning and the dead zones, summary, report and
+publishing proceed exactly as before, and the page wraps its table the same
+way. Keep both wrappers. The phone's Load test chip shows the last uplink
+burst's median and the latest downlink rate when healthy, and Rig detail shows
+the burst schedule in force, so an update can be confirmed from the phone.
+
 **Pause means "this time did not happen".** It stops measuring and recording
 both, so paused seconds leave no samples and no video. That is what makes the
 headline percentage meaningful, since it is a percentage of time and there is no
