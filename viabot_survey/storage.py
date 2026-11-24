@@ -277,13 +277,29 @@ class Storage:
              "held" if held else "pending", now, now),
         )
 
+    #: What goes first. A report is a few kilobytes and is what somebody is
+    #: waiting to read; a full walk video is hundreds of megabytes over the
+    #: link being surveyed. Strictly oldest-first, a requested video kept the
+    #: place its walk had and held every later walk's report back behind it:
+    #: on 2026-11-24 a batch of requested videos kept a morning's reports off
+    #: the server for most of an hour.
+    UPLOAD_PRIORITY = "CASE kind WHEN 'report' THEN 0 WHEN 'clip' THEN 1 ELSE 2 END"
+
     def pending_uploads(self, limit: int = 50) -> list[dict]:
-        """Oldest first, so a run finishes publishing before the next starts."""
+        """Reports first, then clips, then full videos; oldest first in each."""
         rows = self.connection().execute(
-            "SELECT * FROM uploads WHERE state = 'pending' ORDER BY id LIMIT ?",
+            "SELECT * FROM uploads WHERE state = 'pending' "
+            f"ORDER BY {self.UPLOAD_PRIORITY}, id LIMIT ?",
             (limit,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def smaller_upload_waiting(self) -> bool:
+        """Whether a report or a clip is waiting, so a video should step aside."""
+        row = self.connection().execute(
+            "SELECT 1 FROM uploads WHERE state = 'pending' "
+            "AND kind IN ('report', 'clip') LIMIT 1").fetchone()
+        return row is not None
 
     def release_held_uploads(self, run_id: str, kind: str | None = None) -> int:
         """Move 'held' rows to 'pending' — someone asked for the full video."""

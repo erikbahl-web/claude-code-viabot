@@ -440,3 +440,51 @@ def test_asking_for_a_video_that_already_arrived_says_that_instead(receiver):
     assert "Watch the full recording" in body
     # And it must not re-ask the rig for something it has already sent.
     assert "requests" not in receiver.read_meta("20260917-144217-office-test-07")
+
+
+# ---- what goes first ----------------------------------------------------------
+#
+# 2026-11-24: a batch of requested full videos kept a morning's reports off the
+# server for most of an hour. Strictly oldest-first, a requested video kept the
+# place its walk had, ahead of every later walk's report.
+
+def test_reports_go_before_clips_and_clips_before_full_videos(tmp_path):
+    storage = Storage(tmp_path / "survey.db")
+    storage.create_run("old", label="Level 1")
+    storage.create_run("new", label="Level 2")
+    storage.enqueue_upload("old", "video", "/v", "video/full.mp4", 1)
+    storage.enqueue_upload("old", "clip", "/c", "clips/a.mp4", 1)
+    storage.enqueue_upload("new", "clip", "/c2", "clips/b.mp4", 1)
+    storage.enqueue_upload("new", "report", "/r", "index.html", 1)
+    order = [(r["run_id"], r["kind"]) for r in storage.pending_uploads()]
+    assert order == [("new", "report"), ("old", "clip"), ("new", "clip"),
+                     ("old", "video")]
+
+
+def test_a_report_queued_during_a_video_upload_goes_next(receiver, tmp_path):
+    """The video steps aside between chunks, and picks up where it stopped."""
+    video = _file(tmp_path / "video" / "full.mp4", 400_000)
+    page = _file(tmp_path / "reports" / "index.html", 5_000)
+    storage, worker = _rig(tmp_path, receiver)
+    storage.create_run("walk-1", label="Level 1")
+    storage.create_run("walk-2", label="Level 2")
+    storage.enqueue_upload("walk-1", "video", str(video), "video/full.mp4", 400_000)
+
+    landed = []
+    real = storage.update_upload
+
+    def watch(upload_id, **kwargs):
+        real(upload_id, **kwargs)
+        # A walk ends while the video is part way out.
+        if kwargs.get("sent_bytes") and not landed:
+            landed.append("queued")
+            storage.enqueue_upload("walk-2", "report", str(page), "index.html", 5_000)
+        if kwargs.get("state") == "done":
+            landed.append(storage.connection().execute(
+                "SELECT kind FROM uploads WHERE id = ?", (upload_id,)).fetchone()[0])
+
+    storage.update_upload = watch
+    assert worker.drain() == 2
+    assert landed == ["queued", "report", "video"]
+    assert _digest(_stored(receiver, "walk-1", "video/full.mp4")) == _digest(video)
+    assert _digest(_stored(receiver, "walk-2", "index.html")) == _digest(page)
