@@ -435,6 +435,15 @@ so a re-analysis cannot clobber an upload in flight. The consequence is that
 improvements to the report page reach the next walk's report and never the ones
 already uploaded.
 
+**Reports go first, full videos last.** `Storage.pending_uploads` orders the
+queue report, then clip, then video, oldest first within each, and a video
+steps aside between chunks when a report or clip is waiting (it resumes from
+the receiver's byte count, so that costs nothing). Strictly oldest-first, a
+requested full video kept its walk's place in the queue and held every later
+walk's report back: on 2026-11-24 a batch of them kept a morning's reports off
+the server for most of an hour. `PublisherWorker.drain` asks the queue again
+after every file for the same reason.
+
 **Uploading during a walk would poison the walk.** The publisher sends over
 the same cellular link the survey is measuring, so it idles while a run is
 active and resumes afterwards. `PublisherWorker.busy` is what enforces this;

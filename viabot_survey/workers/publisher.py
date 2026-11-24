@@ -83,14 +83,26 @@ class PublisherWorker(Worker):
 
     # -- work ----------------------------------------------------------------
 
-    def drain(self) -> int:
-        """Upload every pending file. Returns how many finished."""
+    def drain(self, max_files: int = 500) -> int:
+        """Upload every pending file, most wanted first. Returns how many finished.
+
+        The queue is asked again after every file rather than read once, so a
+        report queued while a long video is going out is next, not last.
+        """
         finished = 0
-        for row in self.storage.pending_uploads():
+        for _ in range(max_files):
             if self.stopping or self.busy():
                 break
+            pending = self.storage.pending_uploads(limit=1)
+            if not pending:
+                break
+            row = pending[0]
             if self.send_one(row):
                 finished += 1
+            elif self.storage.pending_uploads(limit=1) == [row]:
+                # Nothing changed and nothing more urgent arrived: stopped
+                # for a reason the next cycle will deal with.
+                break
         return finished
 
     def send_one(self, row: dict) -> bool:
@@ -118,12 +130,17 @@ class PublisherWorker(Worker):
                 return False
 
         self.ensure_manifest(run_id)
+        # A video steps aside, between chunks, for a report or clip that has
+        # come in since it started. The upload resumes from the receiver's own
+        # byte count, so stopping part way costs nothing.
+        stepping_aside = (self.storage.smaller_upload_waiting
+                          if row["kind"] == "video" else (lambda: False))
         try:
             sent = self.client.upload(
                 run_id, name, path,
                 on_progress=lambda offset: self.storage.update_upload(
                     row["id"], sent_bytes=offset),
-                should_stop=lambda: self.stopping or self.busy())
+                should_stop=lambda: self.stopping or self.busy() or stepping_aside())
         except PublishError as exc:
             self.storage.update_upload(row["id"], error=str(exc), bump_attempts=True)
             raise
