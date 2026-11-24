@@ -1,3 +1,4 @@
+import pytest
 import time
 
 from viabot_survey.workers.ping import PingWorker
@@ -141,3 +142,58 @@ def test_a_worker_that_has_never_had_a_reply_is_not_called_healthy():
     worker._set_state(STATE_DEGRADED, "never got a reply")
     worker.snapshot(1_000_000.0)
     assert worker.state == STATE_DEGRADED
+
+
+# ---- leaving out pings that queued behind the rig's own uplink test ---------
+#
+# Ping is averaged over ten seconds, and the gap between uplink bursts is
+# about that long. Read whole, the window held pings that had sat in the
+# modem's queue behind the last burst for the entire gap, and on 2026-11-24
+# the phone showed bad reception in a spot known to be good for nearly the
+# whole of an office test.
+
+def _feed(worker, now, lines):
+    for offset, body in lines:
+        worker.handle_line(f"[{now + offset:.6f}] {body}")
+
+
+def test_pings_sent_before_the_test_let_go_are_left_out():
+    worker = make_worker(window_s=10)
+    now = time.time()
+    _feed(worker, now, [
+        # Sent during the burst: queued, 1.4 s round trips, two lost.
+        (1.4, "64 bytes from 8.8.8.8: icmp_seq=1 ttl=117 time=1400 ms"),
+        (2.0, "no answer yet for icmp_seq=2"),
+        (3.0, "no answer yet for icmp_seq=3"),
+        # Sent after it let go at now + 4: a clean link.
+        (5.05, "64 bytes from 8.8.8.8: icmp_seq=5 ttl=117 time=45.0 ms"),
+        (6.05, "64 bytes from 8.8.8.8: icmp_seq=6 ttl=117 time=47.0 ms"),
+    ])
+    whole = worker.snapshot(now=now + 6.5)
+    clean = worker.snapshot(now=now + 6.5, since=now + 4)
+    assert whole["loss_pct"] == 40.0
+    assert clean["sent"] == 2
+    assert clean["loss_pct"] == 0.0
+    assert clean["rtt_ms"] == 47.0
+
+
+def test_a_ping_is_dated_by_when_it_was_sent_not_when_it_came_back():
+    """A reply that left during the burst and arrived after it was queued
+    behind the test, however late it lands."""
+    worker = make_worker(window_s=10)
+    now = time.time()
+    _feed(worker, now, [(4.5, "64 bytes from 8.8.8.8: icmp_seq=1 ttl=117 time=1500 ms")])
+    assert worker.snapshot(now=now + 5, since=now + 4)["sent"] == 0
+    assert worker.snapshot(now=now + 5, since=now + 2.9)["sent"] == 1
+
+
+def test_a_late_reply_replaces_its_no_answer_and_its_send_time():
+    worker = make_worker(window_s=10)
+    now = time.time()
+    _feed(worker, now, [
+        (1.0, "no answer yet for icmp_seq=1"),
+        (1.2, "64 bytes from 8.8.8.8: icmp_seq=1 ttl=117 time=1200 ms"),
+    ])
+    snapshot = worker.snapshot(now=now + 2)
+    assert snapshot["loss_pct"] == 0.0
+    assert worker._results[1]["sent"] == pytest.approx(now, abs=0.01)

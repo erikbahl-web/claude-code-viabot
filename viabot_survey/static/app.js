@@ -15,11 +15,11 @@
 
   var STATUS_TEXT = {
     good: "GOOD", degraded: "DEGRADED", bad: "BAD",
-    dead: "DEAD ZONE", unknown: "NO DATA"
+    dead: "DEAD ZONE", unknown: "NO DATA", testing: "UPLINK TEST"
   };
   var STATUS_COLORS = {
     good: "#22c55e", degraded: "#eab308", bad: "#f97316",
-    dead: "#ef4444", unknown: "#64748b"
+    dead: "#ef4444", unknown: "#64748b", testing: "#60a5fa"
   };
   // Two rows of three: what is being measured, then the rig itself.
   var HEALTH_ORDER = ["camera", "link", "load", "power", "disk", "clock"];
@@ -113,23 +113,46 @@
 
   // ---- connection ---------------------------------------------------------
 
-  function renderBanner(sample) {
-    var status = (sample && sample.status) || "unknown";
+  function rounded(value) {
+    return value === null || value === undefined ? "—" : Math.round(value);
+  }
+
+  // While the rig's own uplink test has the link, ping queues behind it and
+  // describes the test, not the place. Judging it showed BAD and DEAD ZONE
+  // in a spot known to be good, for most of every walk. So the banner says
+  // what is happening and shows the last reading that could be believed.
+  function renderBanner(sample, now) {
+    var testing = !!sample.testing;
+    var status = testing ? "testing" : (sample.status || "unknown");
+    var shown = testing ? (sample.last_judged || {}) : sample;
     el("banner").className = "banner " + status;
     el("statusLabel").textContent = STATUS_TEXT[status] || status.toUpperCase();
-    el("mRtt").textContent = sample.rtt_ms === null || sample.rtt_ms === undefined
-      ? "—" : Math.round(sample.rtt_ms);
-    el("mLoss").textContent = sample.loss_pct === null || sample.loss_pct === undefined
-      ? "—" : Math.round(sample.loss_pct);
+    el("mRtt").textContent = rounded(shown.rtt_ms);
+    el("mLoss").textContent = rounded(shown.loss_pct);
+
+    var sub = el("bannerSub");
+    if (testing) {
+      var last = sample.last_judged;
+      sub.textContent = last && last.status
+        ? "Last ping check: " + (STATUS_TEXT[last.status] || last.status) +
+          ", " + clock(Math.max(0, (now || last.ts) - last.ts)) + " ago"
+        : "Ping is paused while the rig tests the uplink";
+      sub.hidden = false;
+    } else {
+      sub.hidden = true;
+    }
 
     ribbon.push(status);
     while (ribbon.length > RIBBON_SECONDS) { ribbon.shift(); }
     drawRibbon();
 
-    if (status === "dead" && lastStatus !== "dead" && navigator.vibrate) {
-      navigator.vibrate([140, 70, 140]);
+    // Only a reading that can be believed may buzz the operator.
+    if (!testing) {
+      if (status === "dead" && lastStatus !== "dead" && navigator.vibrate) {
+        navigator.vibrate([140, 70, 140]);
+      }
+      lastStatus = status;
     }
-    lastStatus = status;
   }
 
   function drawRibbon() {
@@ -178,12 +201,9 @@
       el("runDead").textContent = run.dead_zone_estimate === undefined
         ? "—" : run.dead_zone_estimate;
 
-      // Live percentage uses the same definition as the final report: seconds
-      // classified dead over seconds walked.
-      var walked = run.walked_s || 0;
-      el("runRunnable").textContent = walked > 0
-        ? Math.round(100 * (walked - (run.dead_seconds || 0)) / walked)
-        : "—";
+      // Worked out on the rig by the report's own code, so the number on
+      // the phone is the number the report will give.
+      el("runRunnable").textContent = rounded(run.runnable_pct);
     }
 
     if (wrapup && !run) {
@@ -256,7 +276,7 @@
       consecutiveFailures = 0;
       el("offline").hidden = true;
       renderHealth(data.health);
-      renderBanner(data.sample || {});
+      renderBanner(data.sample || {}, data.now);
       renderRun(data);
       renderSystem(data.system, data.uplink_schedule);
       el("provisionalNote").hidden = !data.thresholds_provisional;

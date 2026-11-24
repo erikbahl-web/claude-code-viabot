@@ -99,6 +99,10 @@ html, body {
 .banner.degraded { background: var(--degraded); }
 .banner.bad { background: var(--bad); }
 .banner.dead { background: var(--dead); color: #fff; }
+/* The rig's own uplink test has the link: not a quality, so not a colour from
+   the quality scale. */
+.banner.testing { background: #60a5fa; }
+.banner-sub { font-size: .8rem; font-weight: 600; opacity: .9; margin-top: 3px; }
 
 .banner-row {
   display: flex; align-items: baseline; justify-content: space-between;

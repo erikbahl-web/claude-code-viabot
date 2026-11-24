@@ -493,6 +493,33 @@ chip shows the last uplink burst's median and the latest downlink rate when
 healthy, and Rig detail shows the burst schedule in force, so an update can be
 confirmed from the phone.
 
+**The phone must not judge ping while the rig's own uplink test has the
+link.** Office test, 2026-11-24: the banner showed very bad reception in a spot
+known to be good, and dead zones during a walk the report then called 100%
+runnable. The banner, its vibration, the live dead-zone count and the live
+percentage all judged ping inside upload bursts, when ping queues behind the
+test; the report never did. Worse, ping is averaged over `window_s` (10 s), and
+at 20/10 the gap after a burst is about that long, so the window still held
+queued pings for the *whole* gap and no second was ever clean. Now:
+
+- `PingWorker` records when each ping was *sent*, and `snapshot(since=...)`
+  leaves out pings sent before the uplink test let go (`UdpLoadWorker.quiet_since`).
+  The sampler uses that for every second after a burst; a second with no such
+  ping yet is stored as settling and not judged, because a reading made of
+  nothing would count as usable.
+- Seconds inside a burst neither add to nor end the dead streak behind the
+  banner's DEAD ZONE, the same way the report stitches across them.
+- The banner shows **UPLINK TEST** in a colour off the quality scale, with the
+  last reading that could be believed and how old it is. Only a believable
+  reading may vibrate.
+- The live dead-zone count and runnable percentage are computed every
+  `LIVE_RECOUNT_S` from the stored samples by `deadzones.measurable`,
+  `find_dead_zones` and `summarise`: the report's own code, so the two cannot
+  disagree. Do not go back to counting them separately as samples arrive.
+
+The cost is honest but real: at 20/10 the banner reads UPLINK TEST for most of
+a walk, and dead zones are judged on roughly a fifth of it.
+
 **Pause means "this time did not happen".** It stops measuring and recording
 both, so paused seconds leave no samples and no video. That is what makes the
 headline percentage meaningful, since it is a percentage of time and there is no

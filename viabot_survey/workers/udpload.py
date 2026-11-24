@@ -1072,6 +1072,15 @@ class UdpLoadWorker(Worker):
         return LOAD_SENDING if sending else LOAD_SETTLING
 
     @property
+    def quiet_since(self) -> float:
+        """When this test last let go of the uplink, settling included.
+
+        Zero if it never held it. A ping sent before this moment may have
+        queued behind the test, so it says nothing about the place.
+        """
+        return self._load_until if self.direction == UPLINK else 0.0
+
+    @property
     def offered_mbps(self) -> float | None:
         """The rate this worker asks the link for, in Mbit/s.
 

@@ -1,3 +1,4 @@
+import json
 import time
 
 from viabot_survey.runner import classify, slugify
@@ -604,3 +605,121 @@ def test_an_uplink_clip_window_never_exceeds_a_minute(runner, storage, monkeypat
     assert len(windows) == 1
     start, end = windows[0]
     assert end - start <= 61
+
+
+# ---- the phone during the rig's own uplink test ------------------------------
+#
+# 2026-11-24, office test: the banner showed very bad reception in a spot known
+# to be good, and dead zones during a walk the report then called 100%
+# runnable. The banner, the live dead-zone count and the live percentage all
+# judged ping during the rig's own uplink bursts, when ping queues behind the
+# test, and the report did not.
+
+def _ping(runner, monkeypatch, whole, clean=None):
+    """Make ping report ``whole``, or ``clean`` when asked for pings sent after
+    the uplink test let go."""
+    runner.ping.enabled = True
+    monkeypatch.setattr(runner.ping, "snapshot",
+                        lambda now=None, since=None: dict(clean if since and clean is not None
+                                                          else whole))
+
+
+def _uplink(runner, monkeypatch, state, quiet_since=0.0):
+    runner.udp_up.enabled = True
+    monkeypatch.setattr(runner.udp_up, "start", lambda: None)
+    monkeypatch.setattr(type(runner.udp_up), "load_state", property(lambda self: state))
+    monkeypatch.setattr(type(runner.udp_up), "quiet_since",
+                        property(lambda self: quiet_since))
+
+
+BURST = {"rtt_ms": 1400.0, "loss_pct": 100.0, "jitter_ms": 300.0, "sent": 10}
+CLEAN = {"rtt_ms": 45.0, "loss_pct": 0.0, "jitter_ms": 2.0, "sent": 3}
+
+
+def test_a_second_inside_a_burst_is_shown_as_the_test_not_as_reception(runner, monkeypatch):
+    _uplink(runner, monkeypatch, udpload.LOAD_SENDING)
+    _ping(runner, monkeypatch, BURST)
+    runner._last_judged = {"status": "good", "rtt_ms": 45.0, "loss_pct": 0.0, "ts": 1.0}
+    for _ in range(8):
+        sample = runner.collect_sample()
+    assert sample["testing"] is True
+    assert sample["last_judged"]["status"] == "good"
+    # Eight seconds of total loss inside a burst is not eight seconds of a
+    # dead zone: the streak behind the banner's DEAD ZONE never moved.
+    assert sample["dead_streak_s"] == 0.0
+    assert sample["status"] != "dead"
+
+
+def test_the_gap_after_a_burst_is_judged_only_on_pings_sent_in_it(runner, monkeypatch):
+    _uplink(runner, monkeypatch, udpload.LOAD_IDLE, quiet_since=time.time() - 3)
+    _ping(runner, monkeypatch, whole=BURST, clean=CLEAN)
+    sample = runner.collect_sample()
+    assert sample["testing"] is False
+    assert sample["status"] == "good"
+    assert sample["loss_pct"] == 0.0
+
+
+def test_a_second_with_no_clean_ping_yet_is_not_judged(runner, monkeypatch):
+    """A reading made of nothing would count as a usable second."""
+    _uplink(runner, monkeypatch, udpload.LOAD_IDLE, quiet_since=time.time() - 0.5)
+    _ping(runner, monkeypatch, whole=BURST, clean={"sent": 0, "loss_pct": None, "rtt_ms": None})
+    run_id = runner.start_run(label="Level 2")["id"]
+    sample = runner.collect_sample()
+    runner.stop_run()
+    assert sample["testing"] is True
+    assert sample["uplink_loaded"] == udpload.LOAD_SETTLING
+    assert [r["uplink_loaded"] for r in storage_rows(runner, run_id)] == [udpload.LOAD_SETTLING]
+
+
+def test_long_after_a_burst_the_whole_window_is_used_again(runner, monkeypatch):
+    _uplink(runner, monkeypatch, udpload.LOAD_IDLE, quiet_since=time.time() - 60)
+    _ping(runner, monkeypatch, whole=CLEAN, clean={"sent": 0})
+    sample = runner.collect_sample()
+    assert sample["testing"] is False and sample["status"] == "good"
+
+
+def storage_rows(runner, run_id):
+    return list(runner.storage.iter_samples(run_id))
+
+
+def test_the_phone_and_the_report_give_the_same_numbers(runner, monkeypatch):
+    """The live count and percentage are worked out by the report's own code
+    from the stored samples, so they cannot disagree with it."""
+    monkeypatch.setattr("viabot_survey.runner.LIVE_RECOUNT_S", 0.0)
+    state = {"loaded": udpload.LOAD_IDLE}
+    _uplink(runner, monkeypatch, udpload.LOAD_IDLE)
+    monkeypatch.setattr(type(runner.udp_up), "load_state",
+                        property(lambda self: state["loaded"]))
+    readings = {"now": CLEAN}
+    runner.ping.enabled = True
+    monkeypatch.setattr(runner.ping, "snapshot",
+                        lambda now=None, since=None: dict(readings["now"]))
+    clock = {"t": 1_800_000_000.0}
+    monkeypatch.setattr("viabot_survey.runner.time.time", lambda: clock["t"])
+
+    runner.start_run(label="Level 2")
+    # Clean, then a burst of total loss (the test's doing), then a real
+    # eight-second dead zone, then clean again.
+    plan = ([(udpload.LOAD_IDLE, CLEAN)] * 10 + [(udpload.LOAD_SENDING, BURST)] * 20
+            + [(udpload.LOAD_IDLE, BURST)] * 8 + [(udpload.LOAD_IDLE, CLEAN)] * 10)
+    for loaded, reading in plan:
+        state["loaded"], readings["now"] = loaded, reading
+        runner.collect_sample()
+        clock["t"] += 1.0
+    live = runner.run_summary()
+    result = runner.stop_run()
+    summary = json.loads(result["summary_json"])
+
+    assert live["dead_zone_estimate"] == summary["dead_zone_count"] == 1
+    assert live["runnable_pct"] == summary["runnable_pct"]
+
+
+def test_a_live_count_that_fails_never_stops_sampling(runner, monkeypatch):
+    monkeypatch.setattr("viabot_survey.runner.LIVE_RECOUNT_S", 0.0)
+    _ping(runner, monkeypatch, CLEAN)
+    runner.start_run(label="Level 2")
+    monkeypatch.setattr(runner.storage, "iter_samples",
+                        lambda run_id: (_ for _ in ()).throw(RuntimeError("disk")))
+    runner.collect_sample()
+    assert runner.run_summary()["dead_zone_estimate"] == 0
+    runner.stop_run()

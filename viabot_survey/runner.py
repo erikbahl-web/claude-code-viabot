@@ -26,7 +26,7 @@ from .workers import camera as camera_worker
 from .workers import CameraWorker, DnsWorker, Iperf3Worker, PingWorker, RouterWorker
 from .workers.publisher import PublisherWorker
 from .workers import udpload
-from .workers.udpload import DOWNLINK, UPLINK, UdpLoadWorker
+from .workers.udpload import DOWNLINK, LOAD_SETTLING, UPLINK, UdpLoadWorker
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +40,10 @@ STATUS_UNKNOWN = "unknown"
 STATUS_ORDER = (STATUS_DEAD, STATUS_BAD, STATUS_DEGRADED, STATUS_GOOD, STATUS_UNKNOWN)
 
 SAMPLE_INTERVAL_S = 1.0
+
+#: How often the phone's dead-zone count and runnable percentage are worked
+#: out again, from the stored samples, by the report's own code.
+LIVE_RECOUNT_S = 5.0
 #: The longest an uplink clip's window may be, rolls included, in seconds.
 UPLINK_CLIP_MAX_S = 60.0
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -79,14 +83,17 @@ class SurveyRunner:
         self._stop = threading.Event()
         self._dead_streak_s = 0.0
         self._last_sample: dict | None = None
+        # The last second the ping reading could be believed, for the phone to
+        # show while the uplink test has the link.
+        self._last_judged: dict | None = None
         self._status_seconds: dict[str, float] = {}
         self._undervoltage_warned = False
         self._paused = False
         self._wrapup: dict | None = None
         # Counted live so the operator sees zones accumulate while walking.
         # The authoritative figure is recomputed from stored samples at the end.
-        self._dead_zone_estimate = 0
-        self._in_dead_zone = False
+        self._live: dict = {}
+        self._live_at = 0.0
 
         uplink = config["uplink"]
         self.ping = PingWorker(
@@ -357,8 +364,9 @@ class SurveyRunner:
             self._status_seconds = {}
             self._paused = False
             self._wrapup = None
-            self._dead_zone_estimate = 0
-            self._in_dead_zone = False
+            self._live = {}
+            self._live_at = 0.0
+            self._last_judged = None
 
             if not sysinfo.clock_synced():
                 # Worth shouting about: without a disciplined clock the video
@@ -731,23 +739,29 @@ class SurveyRunner:
 
     def collect_sample(self) -> dict:
         now = time.time()
-        ping = self.ping.snapshot(now) if self.ping.enabled else {}
-        loss = ping.get("loss_pct")
-        rtt = ping.get("rtt_ms")
-
-        if loss is not None and loss >= 100:
-            self._dead_streak_s += SAMPLE_INTERVAL_S
-        else:
-            self._dead_streak_s = 0.0
-
         # Ping shares the modem's buffer with the uplink load test, so a
         # second spent inside a burst is measuring the rig, not the place.
         uplink_loaded = self.udp_up.load_state if self.udp_up.enabled else 0
+        ping = self.ping.snapshot(now) if self.ping.enabled else {}
+        if self.ping.enabled and not uplink_loaded:
+            ping, uplink_loaded = self._clean_ping(now, ping)
+        loss = ping.get("loss_pct")
+        rtt = ping.get("rtt_ms")
 
-        self._track_dead_zone({"loss_pct": loss, "rtt_ms": rtt,
-                               "uplink_loaded": uplink_loaded})
+        # Only seconds the ping reading can be believed about count towards
+        # a dead zone. A burst neither adds to the streak nor ends it: the
+        # walk went on through it, and the report stitches across it too.
+        judged = not uplink_loaded
+        if judged:
+            if loss is not None and loss >= 100:
+                self._dead_streak_s += SAMPLE_INTERVAL_S
+            else:
+                self._dead_streak_s = 0.0
 
         status = classify(loss, rtt, self.config["thresholds"], self._dead_streak_s)
+        if judged and (loss is not None or rtt is not None):
+            self._last_judged = {"status": status, "rtt_ms": rtt,
+                                 "loss_pct": loss, "ts": now}
         dns = self.dns.snapshot() if self.dns.enabled else {}
         signal = self.router.sample_fields() if self.router.enabled else {}
         under_load: dict[str, Any] = {}
@@ -766,6 +780,11 @@ class SurveyRunner:
             "dead_streak_s": round(self._dead_streak_s, 1),
             "undervoltage": undervoltage,
             "uplink_loaded": uplink_loaded,
+            # For the phone: while the uplink test has the link, ping is
+            # describing the test, so the banner shows that and the last
+            # reading that could be believed instead of judging this one.
+            "testing": not judged,
+            "last_judged": self._last_judged,
             **signal,
             **under_load,
         }
@@ -785,7 +804,58 @@ class SurveyRunner:
                 clock_synced=1 if sysinfo.clock_synced() else 0,
                 undervoltage=undervoltage, uplink_loaded=uplink_loaded,
                 **signal, **under_load)
+            self._recount_live(run["id"], now)
         return sample
+
+    def _clean_ping(self, now: float, ping: dict) -> tuple[dict, int]:
+        """The ping reading with the uplink test's leftovers taken out.
+
+        Ping is averaged over ``window_s`` (10 s), and the gap between uplink
+        bursts is about that long. Read whole, the window still holds pings
+        that were queued behind the last burst for the entire gap, so the
+        gap is never clean: the phone showed bad reception in a good spot
+        for nearly the whole walk, and the report judged the gaps on loss the
+        test had caused. Pings sent before the test let go are left out.
+
+        A second with no such ping yet is not judged at all, because a reading
+        made of nothing would count as a usable second.
+        """
+        quiet_since = self.udp_up.quiet_since if self.udp_up.enabled else 0.0
+        if not quiet_since or now - self.ping.window_s >= quiet_since:
+            return ping, 0
+        try:
+            clean = self.ping.snapshot(now, since=quiet_since)
+        except Exception:  # noqa: BLE001 - never lose a sample to this
+            log.exception("could not separate ping from the uplink test")
+            return ping, 0
+        if not clean.get("sent"):
+            return ping, LOAD_SETTLING
+        return clean, 0
+
+    def _recount_live(self, run_id: str, now: float) -> None:
+        """Work out the phone's dead-zone count and percentage again.
+
+        With the report's own code, from the stored samples, so the two
+        cannot disagree. They used to be counted separately from ping as it
+        happened, including the seconds inside uplink bursts, and the phone
+        showed dead zones during a walk the report then called 100%
+        runnable.
+        """
+        if now - self._live_at < LIVE_RECOUNT_S:
+            return
+        self._live_at = now
+        try:
+            config = self.config["deadzone"]
+            samples = list(self.storage.iter_samples(run_id))
+            judged = deadzones.measurable(samples, config)
+            zones = deadzones.find_dead_zones(judged, config)
+            summary = deadzones.summarise(judged, zones,
+                                          loaded_s=len(samples) - len(judged))
+            self._live = {"dead_zone_count": len(zones),
+                          "runnable_pct": summary["runnable_pct"],
+                          "judged_s": summary["judged_s"]}
+        except Exception:  # noqa: BLE001 - a live estimate must never stop sampling
+            log.exception("could not recount the live dead zones")
 
     def _backfill_uplink(self, readings: list) -> None:
         """Write a finished uplink block onto the samples it covers.
@@ -803,21 +873,6 @@ class SurveyRunner:
             self.storage.backfill_samples(run["id"], readings)
         except Exception:  # noqa: BLE001 - a late measurement must never
             log.exception("could not backfill uplink readings")   # kill a run
-
-    def _track_dead_zone(self, sample: dict) -> None:
-        """Count dead zones as they happen, using the same rule as the report."""
-        config = self.config["deadzone"]
-        # Same exclusion the report applies, so the live count on the phone
-        # and the one in the report cannot disagree.
-        if not deadzones.measurable([sample], config):
-            return
-        unusable = deadzones.is_unusable(sample, config)
-        if unusable and not self._in_dead_zone:
-            if self._dead_streak_s >= float(config.get("min_duration_s", 5)):
-                self._in_dead_zone = True
-                self._dead_zone_estimate += 1
-        elif not unusable:
-            self._in_dead_zone = False
 
     def _check_power(self) -> int | None:
         """Flag a sagging supply, once, loudly.
@@ -860,7 +915,11 @@ class SurveyRunner:
             "video_dir": str(run["video_dir"]),
             "status_seconds": {k: round(v, 1) for k, v in self._status_seconds.items()},
             "dead_seconds": round(self._status_seconds.get(STATUS_DEAD, 0.0), 1),
-            "dead_zone_estimate": self._dead_zone_estimate,
+            # Worked out by the report's own code, so the phone and the report
+            # cannot disagree. See _recount_live.
+            "dead_zone_estimate": self._live.get("dead_zone_count", 0),
+            "runnable_pct": self._live.get("runnable_pct"),
+            "judged_s": self._live.get("judged_s"),
             "data_used_mb": round(self.storage.run_data_used_bytes(run["id"]) / 1e6, 1),
         }
 

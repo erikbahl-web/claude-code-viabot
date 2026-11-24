@@ -148,7 +148,13 @@ class PingWorker(Worker):
                 self._record(seq, ts, None)
 
     def _record(self, seq: int, ts: float, rtt: float | None) -> None:
-        self._results[seq] = {"ts": ts, "rtt": rtt}
+        # When the ping went out, not when its line was printed. A reply's
+        # line lands one round trip after the send; "no answer yet" is printed
+        # just before the next ping goes, one interval after. The sampler
+        # needs the send time to leave out pings that were queued behind the
+        # rig's own uplink test, which is a property of when they were sent.
+        sent = ts - (rtt / 1000.0 if rtt is not None else self.interval_s)
+        self._results[seq] = {"ts": ts, "rtt": rtt, "sent": sent}
         self._results.move_to_end(seq)
         self._prune(ts)
 
@@ -163,7 +169,16 @@ class PingWorker(Worker):
 
     # -- readings ------------------------------------------------------------
 
-    def snapshot(self, now: float | None = None) -> dict[str, Any]:
+    def snapshot(self, now: float | None = None,
+                 since: float | None = None) -> dict[str, Any]:
+        """The last ``window_s`` of pings, summarised.
+
+        ``since`` leaves out every ping sent before it. The sampler passes the
+        moment the rig's own uplink test last let go of the link: for
+        ``window_s`` seconds after a burst the window otherwise still holds
+        pings that sat in the modem's queue behind the test, and the loss and
+        latency then describe the test rather than the place.
+        """
         now = time.time() if now is None else now
         cutoff = now - self.window_s
         # Copied in one step before it is looked through. The ping thread adds
@@ -171,7 +186,8 @@ class PingWorker(Worker):
         # reading it in a loop raised "OrderedDict mutated during iteration"
         # about once in two minutes on a busy machine, costing a sample or a
         # status reply each time.
-        window = [e for e in list(self._results.values()) if e["ts"] >= cutoff]
+        window = [e for e in list(self._results.values()) if e["ts"] >= cutoff
+                  and (since is None or e.get("sent", e["ts"]) >= since)]
         rtts = [e["rtt"] for e in window if e["rtt"] is not None]
 
         loss_pct: float | None = None
