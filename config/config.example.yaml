@@ -267,6 +267,19 @@ udp_load:
   # when it happens over most of a walk.
   uplink_saturated_below: 0.85
 
+  # The report's first page lists where the uplink could not carry one robot
+  # stream: bursts that never reported, and bursts whose median delivered
+  # less than uplink_robot_mbps (with that unset, only the silent ones). Not
+  # the 0.85 line above: on this link a 3M burst usually delivers 1.3 to 1.6,
+  # so that would list nearly every burst. The worst get a video clip,
+  # never-reported first, then lowest median, skipping any that sit inside a
+  # dead zone which already has one. This caps how many. Every clip is cut on
+  # the Pi while the operator waits at the end of a walk, and uploaded over
+  # the same cellular link afterwards, so each is held to about a minute and
+  # a bad garage must not turn into a hundred of them. 0 lists them without
+  # cutting any footage.
+  uplink_spot_clips: 6
+
   # --- downlink: the operator's commands, coming in ------------------------
   # Small, but if it collapses the robot stops taking orders. The rig is the
   # receiving end here, so these readings arrive live, once a second.

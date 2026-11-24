@@ -751,3 +751,201 @@ def test_only_the_cut_burst_is_forgiven_not_the_ones_before_it():
 def test_the_plot_does_not_shade_a_cut_burst_as_a_failure():
     mask = report.uplink_sending(_marked("RRRR....SSSS....SSS"))
     assert mask == [True] * 4 + [False] * 4 + [True] * 4 + [False] * 4 + [False] * 3
+
+
+# ---- where the uplink fell short --------------------------------------------
+#
+# The first page gave the uplink's totals and nothing about where in the walk
+# it was weak, and the uplink is the robot's video.
+
+UPLINK_CONFIG = {"enabled": True, "uplink_bitrate": "3M",
+                 "uplink_saturated_below": 0.85, "uplink_robot_mbps": 0.764,
+                 "uplink_block_s": 10, "uplink_idle_s": 20}
+
+
+def _burst_walk(rates, block=10, idle=20):
+    """One burst per entry: a rate it delivered, or None for "never reported"."""
+    rows, ts = [], BASE
+    for rate in rates:
+        for i in range(block):
+            rows.append({"ts": ts, "rtt_ms": 45.0, "loss_pct": 0.0,
+                         "uplink_loaded": 2,
+                         "udp_up_loss_pct": None if rate is None else 1.0,
+                         "udp_up_jitter_ms": None if rate is None else 3.0,
+                         "udp_up_mbps": None if rate is None else rate})
+            ts += 1
+        for i in range(idle):
+            rows.append({"ts": ts, "rtt_ms": 45.0, "loss_pct": 0.0,
+                         "uplink_loaded": 1 if i < 3 else 0})
+            ts += 1
+    return rows
+
+
+def test_bursts_are_found_with_what_each_delivered():
+    bursts = report.uplink_bursts(_burst_walk([2.9, 1.2]))
+    assert [(b["seconds"], b["median_mbps"], b["reported"]) for b in bursts] == [
+        (10, 2.9, True), (10, 1.2, True)]
+    assert bursts[1]["start_ts"] == BASE + 30
+    assert bursts[1]["end_ts"] == BASE + 39
+
+
+def test_a_sending_second_without_a_reading_belongs_to_its_burst():
+    """The first second of a burst is often marked sending with nothing on it.
+    That is not a separate burst that never reported."""
+    walk = _burst_walk([2.9])
+    walk[0].update(udp_up_mbps=None, udp_up_loss_pct=None)
+    bursts = report.uplink_bursts(walk)
+    assert len(bursts) == 1
+    assert bursts[0]["seconds"] == 10 and bursts[0]["readings"] == 9
+
+
+def test_a_pause_splits_a_burst():
+    walk = _burst_walk([2.9], idle=0)
+    for row in walk[5:]:
+        row["ts"] += 600
+    assert len(report.uplink_bursts(walk)) == 2
+
+
+def test_only_bursts_below_one_robot_stream_are_listed():
+    """On this rig's link a 3 Mbit/s burst usually delivers 1.3 to 1.6. A line
+    at 0.85 x offered listed nearly every burst of every walk; one robot's
+    measured stream is the line that says where a robot would struggle."""
+    found = report.uplink_spots(_burst_walk([2.9, 1.4, 1.6, 0.7]), UPLINK_CONFIG)
+    assert found["bursts"] == 4
+    assert [s["median_mbps"] for s in found["spots"]] == [0.7]
+    assert found["spots"][0]["below_robot"] is True
+
+
+def test_with_no_robot_rate_only_silent_bursts_are_listed():
+    config = dict(UPLINK_CONFIG, uplink_robot_mbps=0)
+    found = report.uplink_spots(_burst_walk([0.1, None, 2.9]), config)
+    assert [s["reported"] for s in found["spots"]] == [False]
+
+
+def test_a_burst_that_never_reported_is_listed_and_is_worst():
+    found = report.uplink_spots(_burst_walk([0.5, None, 1.0, 0.3]), UPLINK_CONFIG)
+    spots = found["spots"]
+    # Shown in time order, ranked worst first for footage.
+    assert [s["median_mbps"] for s in spots] == [0.5, None, 0.3]
+    assert [s["worst_rank"] for s in spots] == [3, 1, 2]
+    assert spots[1]["reported"] is False
+
+
+def test_an_old_continuous_run_is_not_one_enormous_burst():
+    """Runs before 2026-09-18 tested the uplink without a break. Re-analysing
+    one read the whole walk as a single burst and tried to clip all of it."""
+    walk = [{"ts": BASE + i, "rtt_ms": 45.0, "loss_pct": 0.0,
+             "udp_up_mbps": 0.2, "udp_up_loss_pct": 50.0} for i in range(600)]
+    found = report.uplink_spots(walk, UPLINK_CONFIG)
+    assert found["bursts"] == 0 and found["spots"] == []
+    assert found["ignored_long"] == 1
+    assert report.longest_burst_s({"uplink_block_s": 20}) == 90.0
+    assert report.longest_burst_s({"uplink_block_s": 40}) == 120.0
+
+
+def test_a_spot_inside_a_dead_zone_with_footage_is_marked_with_it():
+    walk = _burst_walk([None, 0.5])
+    zones = [{"index": 3, "start_ts": BASE + 2, "end_ts": BASE + 20,
+              "clip_path": "/d/deadzone-03-x.mp4"},
+             {"index": 4, "start_ts": BASE + 30, "end_ts": BASE + 35,
+              "clip_path": None}]
+    spots = report.uplink_spots(walk, UPLINK_CONFIG, zones)["spots"]
+    assert spots[0]["dead_zone"] == 3
+    assert spots[0]["dead_zone_clip"] == "/d/deadzone-03-x.mp4"
+    assert "dead_zone_clip" not in spots[1]      # that zone has no footage
+
+
+def test_a_burst_cut_short_by_end_is_not_a_failure():
+    """End lands inside a burst most of the time, and nothing was asked of
+    the server. That is not "sent, nothing arrived"."""
+    walk = _burst_walk([2.9], idle=0) + [
+        {"ts": BASE + 10 + i, "rtt_ms": 45.0, "loss_pct": 0.0,
+         "uplink_loaded": 2} for i in range(6)]
+    found = report.uplink_spots(walk, UPLINK_CONFIG)
+    assert found["spots"] == []
+
+
+def _with_spots(rates, clip=None, **extra):
+    walk = _burst_walk(rates)
+    found = report.uplink_spots(walk, UPLINK_CONFIG)
+    if clip:
+        found["spots"][0]["clip_path"] = clip
+    return dict(REPORT, summary={**REPORT["summary"], "uplink_spots": found},
+                under_load=report.load_stats(walk, UPLINK_CONFIG), **extra)
+
+
+def _first_tab(page):
+    return page[page.index('id="panel-result"'):page.index('id="panel-detail"')]
+
+
+def test_the_first_page_lists_where_the_uplink_fell_short_with_footage():
+    page = _first_tab(report.render_html(_with_spots(
+        [2.9, None, 0.5], clip="/data/clips/r/uplink-01-x-10s.mp4")))
+    title = "Where the uplink could not carry one robot stream"
+    assert title in page
+    # Directly under the uplink block, before the dead zones.
+    assert (page.index("Uplink: the robot") < page.index(title)
+            < page.index("Where the link failed"))
+    assert "a reference, not a tested requirement" in page
+    assert "sent, nothing arrived" in page
+    assert "below one robot stream" in page
+    assert "0.5 of 3 Mbit/s" in page
+    # The same markup the dead-zone rows use, so the inline player picks it up.
+    assert ('href="clips/uplink-01-x-10s.mp4" data-clip="uplink-01-x-10s.mp4"'
+            in page)
+    assert 'id="clipPlayer"' in page
+
+
+def test_an_uplink_clip_alone_still_gets_the_player():
+    page = report.render_html(_with_spots(
+        [None], clip="/data/clips/r/uplink-01-x-10s.mp4", dead_zones=[]))
+    assert 'id="clipPlayer"' in page
+
+
+def test_when_no_burst_fell_short_the_page_says_so_in_one_sentence():
+    page = _first_tab(report.render_html(_with_spots([2.9, 2.8])))
+    assert "None of the 2 uplink bursts fell below one robot stream" in page
+
+
+def test_a_run_analysed_before_this_existed_claims_nothing():
+    walk = _burst_walk([2.9])
+    page = report.render_html(dict(REPORT, under_load=report.load_stats(
+        walk, UPLINK_CONFIG)))
+    assert "could not carry one robot stream" not in page
+
+
+def test_more_spots_than_the_table_shows_are_counted():
+    rates = [0.05 * (i + 1) for i in range(report.UPLINK_SPOT_ROWS + 3)]
+    page = report.render_html(_with_spots(rates))
+    assert "3 more are not listed" in page
+    # The worst are the ones shown: 0.05 is, 0.75 is not.
+    assert "0.05 of 3 Mbit/s" in page
+    assert "0.75 of 3 Mbit/s" not in page
+
+
+def test_a_broken_uplink_summary_never_costs_the_page():
+    built = dict(REPORT, summary={**REPORT["summary"],
+                                  "uplink_spots": {"spots": [{"start_ts": "x"}]}},
+                 under_load=report.load_stats(_burst_walk([2.9]), UPLINK_CONFIG))
+    page = report.render_html(built)
+    assert "Level 2, North Ramp" in page and "85.7%" in page
+
+
+def test_the_uplink_table_is_escaped_and_sends_nobody_to_a_log():
+    built = _with_spots([None], clip='/x/"><script>alert(1)</script>.mp4')
+    built["summary"]["uplink_spots"]["spots"][0]["clip_path"] = None
+    built["summary"]["uplink_spots"]["spots"][0]["clip_error"] = "<b>nope</b>"
+    page = report.render_html(built)
+    assert "<b>nope</b>" not in page
+    assert "event log" not in page
+
+
+def test_a_spot_in_a_dead_zone_links_that_zones_clip():
+    built = _with_spots([None])
+    spot = built["summary"]["uplink_spots"]["spots"][0]
+    spot.update(dead_zone=1, dead_zone_clip="/data/clips/r/deadzone-01-x-45s.mp4")
+    page = _first_tab(report.render_html(built))
+    table = page[page.index("could not carry one robot stream"):
+                 page.index("Where the link failed")]
+    assert "same place as dead zone 1" in table
+    assert 'data-clip="deadzone-01-x-45s.mp4"' in table

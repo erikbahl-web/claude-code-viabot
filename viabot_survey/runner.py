@@ -40,6 +40,8 @@ STATUS_UNKNOWN = "unknown"
 STATUS_ORDER = (STATUS_DEAD, STATUS_BAD, STATUS_DEGRADED, STATUS_GOOD, STATUS_UNKNOWN)
 
 SAMPLE_INTERVAL_S = 1.0
+#: The longest an uplink clip's window may be, rolls included, in seconds.
+UPLINK_CLIP_MAX_S = 60.0
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -452,6 +454,20 @@ class SurveyRunner:
             summary["clip_dir"] = str(clip_dir)
 
         summary["thresholds_provisional"] = bool(config.get("provisional", False))
+        # Separate from everything above on purpose, and never allowed to
+        # fail it: a walk whose uplink table could not be built still has its
+        # dead zones, its headline and its report.
+        try:
+            spots = self._uplink_spots(run_id, samples, video_dir, segments,
+                                       [z.as_dict() for z in zones])
+            if spots is not None:
+                summary["uplink_spots"] = spots
+        except Exception as exc:  # noqa: BLE001 - must never cost the walk
+            log.exception("could not work out where the uplink fell short")
+            self.storage.add_event(
+                f"could not work out where the uplink fell short ({exc}); the "
+                "rest of the result is unaffected",
+                level="warning", source="runner", run_id=run_id)
         self.storage.replace_dead_zones(run_id, [z.as_dict() for z in zones])
         self.storage.set_run_summary(run_id, summary)
 
@@ -478,6 +494,56 @@ class SurveyRunner:
                 "its report and clips are still on the rig",
                 level="warning", source="publisher", run_id=run_id)
         return self._wrapup
+
+    def _uplink_spots(self, run_id: str, samples: list, video_dir: Path,
+                      segments: list, zones: list = ()) -> dict | None:
+        """Find where the uplink could not carry one robot stream, and cut
+        footage of the worst places ping did not already flag.
+
+        None when the run has no uplink bursts at all, which is every run with
+        the load test switched off: there is nothing to say, and saying "none"
+        would claim a measurement that never happened.
+        """
+        found = report.uplink_spots(samples, self.config["udp_load"], zones)
+        if not found["bursts"]:
+            return None
+        spots = found["spots"]
+        limit = max(0, int(self.config["udp_load"].get("uplink_spot_clips") or 0))
+        # A spot inside a dead zone that already has a clip is that clip; the
+        # cap goes on places only the uplink test saw.
+        worst = sorted((s for s in spots if not s.get("dead_zone_clip")),
+                       key=lambda s: s["worst_rank"])[:limit]
+        config = self.config["deadzone"]
+        if worst and config.get("extract_clips", True) and segments:
+            clip_dir = Path(self.config.data_dir) / "clips" / run_id
+            container = "mp4" if self.camera.effective_mode == "overlay" else "mkv"
+            self.storage.add_event(
+                f"cutting {len(worst)} clip(s) where the uplink fell short",
+                source="runner", run_id=run_id)
+            pre = float(config.get("pre_roll_s", 10))
+            post = float(config.get("post_roll_s", 5))
+            # Whatever the data says, never more than about a minute of
+            # footage: every clip is cut on the Pi and sent over cellular.
+            longest = max(0.0, UPLINK_CLIP_MAX_S - pre - post - deadzones.SAMPLE_S)
+            for spot in worst:
+                stretch = deadzones.DeadZone(
+                    index=spot["index"], start_ts=spot["start_ts"],
+                    end_ts=min(spot["end_ts"], spot["start_ts"] + longest))
+                clip_config = dict(config, pre_roll_s=min(pre, UPLINK_CLIP_MAX_S / 2),
+                                   post_roll_s=min(post, UPLINK_CLIP_MAX_S / 2))
+                deadzones.extract_clip(
+                    stretch, segments, video_dir, clip_dir, clip_config,
+                    segment_length_s=float(self.config["camera"]["segment_s"]),
+                    container=container, name_prefix="uplink",
+                    what="uplink burst")
+                spot["clip_path"] = stretch.clip_path
+                spot["clip_error"] = stretch.clip_error
+                if stretch.clip_error:
+                    self.storage.add_event(
+                        f"uplink spot {spot['index']}: no clip "
+                        f"({stretch.clip_error})",
+                        level="warning", source="runner", run_id=run_id)
+        return found
 
     # -- publishing ----------------------------------------------------------
 
@@ -509,7 +575,9 @@ class SurveyRunner:
                                     page.stat().st_size)
         queued = 1
 
-        for zone in built.get("dead_zones") or []:
+        found = (built.get("summary") or {}).get("uplink_spots") or {}
+        spots = (found.get("spots") or []) if isinstance(found, dict) else []
+        for zone in [*(built.get("dead_zones") or []), *spots]:
             clip = zone.get("clip_path")
             if not clip or not Path(clip).exists():
                 continue
@@ -806,7 +874,20 @@ class SurveyRunner:
             "wrapup": self._wrapup,
             "workers": {worker.name: worker.status() for worker in self.workers},
             "iperf_budget_remaining_mb": self.iperf.budget_remaining_mb,
+            "uplink_schedule": self.uplink_schedule(),
         }
+
+    def uplink_schedule(self) -> dict | None:
+        """The burst schedule in force, or None when the uplink test is off.
+
+        Read from the worker rather than the config, so it is what the rig
+        will actually do. The phone shows it so an update can be confirmed
+        to have taken effect without opening a file.
+        """
+        worker = self.udp_up
+        if not worker.enabled:
+            return None
+        return {"on_s": worker.block_s, "off_s": worker.idle_s}
 
     def clear_wrapup(self) -> None:
         self._wrapup = None
@@ -935,7 +1016,24 @@ class SurveyRunner:
             # Uplink only reports when a burst ends, so the first ten seconds
             # of every walk have nothing to show yet. Grey, not green.
             return "idle", "first test running"
-        return "ok", "measuring"
+        return "ok", self._load_numbers(workers, now) or "measuring"
+
+    @staticmethod
+    def _load_numbers(workers: list, now: float) -> str | None:
+        """What a healthy load test is delivering, short enough for the chip.
+
+        The last finished uplink burst's median and the latest downlink
+        second, e.g. "↑2.9 ↓5.0 Mbit/s". The chip shows about fifteen
+        characters, so there is no room for words.
+        """
+        parts = []
+        for worker in workers:
+            mbps = worker.headline_mbps(now)
+            if mbps is None:
+                continue
+            arrow = "\u2191" if worker.direction == UPLINK else "\u2193"
+            parts.append(f"{arrow}{mbps:.1f}")
+        return " ".join(parts) + " Mbit/s" if parts else None
 
     def history(self, seconds: float = 180) -> list[dict]:
         """Recent samples for the sparkline. Falls back to the live reading when

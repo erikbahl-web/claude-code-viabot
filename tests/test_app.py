@@ -377,3 +377,18 @@ def test_the_phone_draws_every_health_chip_the_rig_reports(client):
     reported = set(client.get("/api/status").get_json()["health"])
     assert reported == drawn
     assert drawn <= named
+
+
+def test_the_phone_shows_the_uplink_burst_schedule_in_force(client):
+    """The owner confirms from the phone that an update took effect. The rig
+    must send the schedule, and the page must draw it, or the row is simply
+    missing and nothing says so."""
+    from pathlib import Path
+
+    assert "uplink_schedule" in client.get("/api/status").get_json()
+    script = (Path(__file__).resolve().parent.parent
+              / "viabot_survey" / "static" / "app.js").read_text()
+    assert "renderSystem(data.system, data.uplink_schedule)" in script
+    assert '"Uplink test"' in script
+    # Still a plain script a captive-portal webview will run.
+    assert "import " not in script and "=>" not in script

@@ -384,6 +384,128 @@ def load_stats(samples: Sequence[dict],
     return out
 
 
+#: How many weak uplink bursts the first page lists. A long walk in a bad
+#: garage can have a hundred, and a table that long is not read; the worst
+#: are shown and the rest are counted.
+UPLINK_SPOT_ROWS = 12
+
+
+def uplink_bursts(samples: Sequence[dict]) -> list[dict[str, Any]]:
+    """Every uplink burst in a walk, in time order, with what it delivered.
+
+    A burst is consecutive samples that either carry an uplink reading or
+    were sent during a burst that ran its course (:func:`uplink_sending`),
+    unbroken by a pause. Both kinds go into one group because a burst that
+    reported usually has a sending second at its edge with no reading on it,
+    and that second is not a separate burst that "never reported".
+
+    A group with no reading at all is a burst that was sent and never heard
+    from: the link failed badly enough to take the test down with it.
+    """
+    sending = uplink_sending(samples)
+    groups: list[list[dict]] = []
+    current: list[dict] = []
+    previous: dict | None = None
+    for sample, sent in zip(samples, sending):
+        involved = sent or sample.get("udp_up_mbps") is not None
+        broken = (previous is not None and sample.get("ts") is not None
+                  and previous.get("ts") is not None
+                  and sample["ts"] - previous["ts"] > PAUSE_GAP_S)
+        if current and (not involved or broken):
+            groups.append(current)
+            current = []
+        if involved:
+            current.append(sample)
+        previous = sample
+    if current:
+        groups.append(current)
+
+    bursts = []
+    for group in groups:
+        rates = _numbers(group, "udp_up_mbps")
+        bursts.append({
+            "start_ts": group[0]["ts"],
+            "end_ts": group[-1]["ts"],
+            "seconds": len(group),
+            "readings": len(rates),
+            "reported": bool(rates),
+            "median_mbps": round(_median(rates), 3) if rates else None,
+            "min_mbps": round(min(rates), 3) if rates else None,
+        })
+    return bursts
+
+
+def longest_burst_s(load_config: dict | None = None) -> float:
+    """The longest stretch that can honestly be one uplink burst.
+
+    Runs recorded before 2026-09-18 tested the uplink continuously, so the
+    whole walk reads as a single "burst". Re-analysing one used to try to
+    list it and cut an hour-long clip of it.
+    """
+    block_s = float((load_config or {}).get("uplink_block_s") or 20)
+    return max(3 * block_s, 90.0)
+
+
+def uplink_spots(samples: Sequence[dict], load_config: dict | None = None,
+                 zones: Sequence[dict] = ()) -> dict[str, Any]:
+    """Where in the walk the uplink could not carry one robot stream.
+
+    A burst is listed if it never reported, or if its median delivered rate
+    was below ``uplink_robot_mbps``: the peak of the one real teleop session
+    measured. Not the 0.85 x offered saturation line: on this rig's link a
+    3 Mbit/s burst usually delivers 1.3 to 1.6, so that line listed nearly
+    every burst of every walk and said nothing about where. With no robot
+    rate set, only bursts that never reported are listed.
+
+    A burst longer than :func:`longest_burst_s` is not a burst but an old
+    continuous test, and is ignored entirely.
+
+    ``zones`` are the walk's dead zones. A spot overlapping one that already
+    has footage is marked with it, so the page can link that clip rather
+    than cut a second one of the same place.
+
+    ``worst_rank`` orders them for choosing which get footage: never reported
+    first, then lowest median. The list itself stays in time order, which is
+    how a reader walks it.
+    """
+    config = load_config or {}
+    offered = parse_bitrate_mbps(config.get("uplink_bitrate"))
+    robot = float(config.get("uplink_robot_mbps") or 0)
+    longest = longest_burst_s(config)
+    every = uplink_bursts(samples)
+    bursts = [b for b in every if b["seconds"] <= longest]
+
+    spots = []
+    for burst in bursts:
+        median = burst["median_mbps"]
+        below_robot = bool(robot) and median is not None and median < robot
+        if burst["reported"] and not below_robot:
+            continue
+        spot = dict(burst, below_robot=below_robot)
+        for zone in zones:
+            if (zone.get("clip_path") and zone.get("start_ts") is not None
+                    and zone["start_ts"] <= burst["end_ts"]
+                    and burst["start_ts"] <= zone.get("end_ts", zone["start_ts"])):
+                spot["dead_zone"] = zone.get("index") or zone.get("idx")
+                spot["dead_zone_clip"] = zone["clip_path"]
+                break
+        spots.append(spot)
+    ranked = sorted(range(len(spots)), key=lambda i: (
+        spots[i]["reported"], spots[i]["median_mbps"] or 0.0,
+        spots[i]["start_ts"]))
+    for rank, i in enumerate(ranked, start=1):
+        spots[i]["worst_rank"] = rank
+    for index, spot in enumerate(spots, start=1):
+        spot["index"] = index
+    return {
+        "bursts": len(bursts),
+        "ignored_long": len(every) - len(bursts),
+        "offered_mbps": round(offered, 3) if offered else None,
+        "robot_mbps": robot or None,
+        "spots": spots,
+    }
+
+
 #: Columns the throughput plot is bucketed into. A walk is sampled at 1 Hz, so
 #: an hour underground is 3,600 readings per direction — more than a 900-pixel
 #: plot can show and more than belongs in a page that has to be uploaded over
@@ -954,20 +1076,96 @@ def _grade(pct: float | None) -> str:
     return "good" if pct >= 95 else "bad" if pct < 80 else "mid"
 
 
+def _clip_link(item: dict, pre_roll: float, post_roll: float,
+               missing: str = "no clip") -> str:
+    clip = item.get("clip_path")
+    if clip:
+        name = str(clip).rsplit("/", 1)[-1]
+        # Still a plain link: without script, and off a USB stick, this
+        # is the only thing that works. Script upgrades it to a player on
+        # the page, which is the only way the turn control reaches clips.
+        return (f'<a href="{CLIP_DIR}/{_e(name)}" data-clip="{_e(name)}">'
+                f'watch {int(pre_roll)}s before &rarr; '
+                f'{int(post_roll)}s after</a>')
+    return f'<span class="muted">{_e(item.get("clip_error") or missing)}</span>'
+
+
+def _uplink_spot_block(found: dict | None, pre_roll: float,
+                       post_roll: float) -> str:
+    """Where the uplink could not carry one robot stream, in time order.
+
+    Only ever called when the uplink was measured. Absent data (a run
+    analysed before this existed) draws nothing rather than "none", which
+    would be a claim nobody checked.
+    """
+    if not found or not isinstance(found.get("spots"), list):
+        return ""
+    spots = found["spots"]
+    offered = found.get("offered_mbps")
+    robot = found.get("robot_mbps")
+    bursts = int(found.get("bursts") or 0)
+    heading = "<h3>Where the uplink could not carry one robot stream</h3>"
+    line = (f'<p class="sub">The line is {robot:g}&nbsp;Mbit/s, the peak of the '
+            "one real teleop session measured: a reference, not a tested "
+            "requirement. A burst is listed when its median fell below it, or "
+            "when nothing it sent arrived at all.</p>" if robot else
+            '<p class="sub">No robot stream rate is set on the rig, so only '
+            "bursts where nothing arrived at all are listed.</p>")
+    ignored = int(found.get("ignored_long") or 0)
+    if ignored:
+        line += (f'<p class="sub">{ignored} stretch'
+                 f'{"" if ignored == 1 else "es"} of continuous uplink testing '
+                 "were left out: that is how runs were recorded before the "
+                 "test ran in bursts, and it cannot be placed in the walk.</p>")
+    if not spots:
+        return (heading + f'<p class="sub">None of the {bursts} uplink bursts '
+                "fell below one robot stream, and every one of them "
+                "reported.</p>" + line)
+    shown = sorted(sorted(spots, key=lambda s: s.get("worst_rank") or 0)
+                   [:UPLINK_SPOT_ROWS], key=lambda s: s.get("start_ts") or 0)
+    rows = []
+    for spot in shown:
+        median = spot.get("median_mbps")
+        if spot.get("reported") and median is not None:
+            got = f"{median:g}"
+            low = spot.get("min_mbps")
+            if low is not None and low != median:
+                got += f" (lowest {low:g})"
+            got += (f" of {offered:g}" if offered else "") + " Mbit/s"
+        else:
+            got = "none" + (f" of {offered:g} Mbit/s" if offered else "")
+        note = ("sent, nothing arrived" if not spot.get("reported")
+                else "below one robot stream")
+        if spot.get("dead_zone_clip"):
+            # Ping already flagged this place and its clip shows it. A second
+            # clip of the same spot would only cost the upload.
+            note += f"; same place as dead zone {spot.get('dead_zone')}"
+            footage = _clip_link({"clip_path": spot["dead_zone_clip"]},
+                                 pre_roll, post_roll)
+        else:
+            footage = _clip_link(spot, pre_roll, post_roll, "no clip cut")
+        rows.append(
+            f'<tr><td class="mono">{_e(clock_time(spot.get("start_ts")))}</td>'
+            f'<td class="num">{_e(duration(spot.get("seconds")))}</td>'
+            f'<td class="num">{_e(got)}</td><td>{_e(note)}</td>'
+            f"<td>{footage}</td></tr>")
+    hidden = len(spots) - len(shown)
+    more = (f'<p class="sub">{hidden} more are not listed; these are the '
+            f"{len(shown)} worst.</p>" if hidden > 0 else "")
+    return (heading
+            + f'<p class="sub">{len(spots)} of the {bursts} uplink bursts.</p>'
+            '<table><thead><tr><th>Started</th><th class="num">Lasted</th>'
+            '<th class="num">Delivered</th><th>Note</th><th>Footage</th>'
+            f"</tr></thead><tbody>{''.join(rows)}</tbody></table>{more}"
+            + line
+            + '<p class="sub">Times are the rig\'s local clock, the same one '
+            "burned into the video.</p>")
+
+
 def _dead_zone_rows(zones: Sequence[dict], pre_roll: float, post_roll: float) -> str:
     rows = []
     for zone in zones:
-        clip = zone.get("clip_path")
-        if clip:
-            name = str(clip).rsplit("/", 1)[-1]
-            # Still a plain link: without script, and off a USB stick, this
-            # is the only thing that works. Script upgrades it to a player on
-            # the page, which is the only way the turn control reaches clips.
-            link = (f'<a href="{CLIP_DIR}/{_e(name)}" data-clip="{_e(name)}">'
-                    f'watch {int(pre_roll)}s before &rarr; '
-                    f'{int(post_roll)}s after</a>')
-        else:
-            link = f'<span class="muted">{_e(zone.get("clip_error") or "no clip")}</span>'
+        link = _clip_link(zone, pre_roll, post_roll)
         loss = zone.get("worst_loss_pct")
         rtt = zone.get("worst_rtt_ms")
         rows.append(
@@ -1000,6 +1198,8 @@ def render_html(report: dict, *, deadzone_config: dict | None = None,
     quality = report.get("quality") or {}
     zones = report.get("dead_zones") or []
     pct = report.get("runnable_pct")
+    found = summary.get("uplink_spots")
+    spot_clips = (found.get("spots") or []) if isinstance(found, dict) else []
 
     label = run.get("label") or "Unnamed run"
     started = run.get("started_at")
@@ -1129,7 +1329,8 @@ def render_html(report: dict, *, deadzone_config: dict | None = None,
 
     # Revealed by script when a clip is clicked. Hidden and empty otherwise,
     # so a report read without script never shows a player it cannot fill.
-    if any(z.get("clip_path") for z in zones):
+    if any(z.get("clip_path") for z in [*zones, *spot_clips]
+           if isinstance(z, dict)):
         clip_player = (
             '<div id="clipPlayer" hidden>'
             '<h2>Clip</h2>'
@@ -1332,6 +1533,12 @@ def render_html(report: dict, *, deadzone_config: dict | None = None,
             f"{_load_said(events)}</div>")
     else:
         uplink_block = ""
+    if uplink_block and found and (up_half.get("seconds_measured")
+                                   or (isinstance(found, dict) and found.get("spots"))):
+        try:
+            uplink_block += _uplink_spot_block(found, pre_roll, post_roll)
+        except Exception:  # noqa: BLE001 - one table must never cost the page
+            uplink_block += ""
 
     # -- the combined score, and the half of it that is the problem ----------
     score = report.get("radio_score") or {}
