@@ -312,6 +312,11 @@ def create_app(config: Config, runner: SurveyRunner, storage: Storage,
     def api_update_apply():
         if runner.active_run_id:
             return jsonify({"error": "stop the run before updating"}), 409
+        # End analyses the walk after the run has stopped. Restarting the
+        # service in the middle of that loses the report, so wait for it.
+        if runner.analysing:
+            return jsonify({"error": "still analysing the last walk; wait for "
+                                     "the result screen, then update"}), 409
         try:
             result = updater.apply()
         except UpdateError as exc:

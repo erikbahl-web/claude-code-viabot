@@ -94,6 +94,7 @@ class SurveyRunner:
         # The authoritative figure is recomputed from stored samples at the end.
         self._live: dict = {}
         self._live_at = 0.0
+        self._analysing = 0
 
         uplink = config["uplink"]
         self.ping = PingWorker(
@@ -243,6 +244,13 @@ class SurveyRunner:
         if not self.ping.enabled:
             return None
         sample = self._last_sample or {}
+        if sample.get("testing"):
+            # Inside a burst, ping describes the test. The last reading that
+            # could be believed is the better witness, while it is recent.
+            judged = self._last_judged
+            if not judged or time.time() - judged["ts"] > 45:
+                return None
+            sample = judged
         loss = sample.get("loss_pct")
         if loss is None:
             return None
@@ -297,29 +305,47 @@ class SurveyRunner:
         Runs on a background thread: the analysis cuts video clips, and the
         dashboard should not be unreachable while that happens.
         """
+        pending: list[str] = []
         stale = self.storage.active_run()
-        if not stale:
+        if stale:
+            run_id = stale["id"]
+            self.storage.end_run(run_id)
+            self.storage.add_event(
+                f"run {run_id} was cut off mid-walk; analysing what was recorded",
+                level="warning", source="runner", run_id=run_id)
+            pending.append(run_id)
+        # A run that was ended but never analysed: End records the end first
+        # and then cuts clips, so power cut or an update in that window left a
+        # walk with no report and nothing to say so. Only the last week, so a
+        # run whose analysis fails every time is not retried for ever.
+        try:
+            for run in self.storage.unanalysed_runs(time.time() - 7 * 86400):
+                if run["id"] in pending:
+                    continue
+                self.storage.add_event(
+                    f"run {run['id']} ended but was never analysed; analysing it now",
+                    level="warning", source="runner", run_id=run["id"])
+                pending.append(run["id"])
+        except Exception:  # noqa: BLE001 - recovery must never block startup
+            log.exception("could not look for runs that were never analysed")
+        if not pending:
             return
-        run_id = stale["id"]
-        self.storage.end_run(run_id)
-        self.storage.add_event(
-            f"run {run_id} was cut off mid-walk; analysing what was recorded",
-            level="warning", source="runner", run_id=run_id)
 
         def salvage() -> None:
-            try:
-                result = self.analyse_run(run_id)
-                summary = result["summary"]
-                if summary.get("runnable_pct") is None:
+            for run_id in pending:
+                try:
+                    result = self.analyse_run(run_id)
+                    summary = result["summary"]
+                    if summary.get("runnable_pct") is None:
+                        self.storage.add_event(
+                            f"run {run_id} had no usable samples to analyse",
+                            level="warning", source="runner", run_id=run_id)
+                except Exception:  # noqa: BLE001 - salvage must never block startup
+                    log.exception("could not salvage %s", run_id)
                     self.storage.add_event(
-                        f"run {run_id} had no usable samples to analyse",
-                        level="warning", source="runner", run_id=run_id)
-            except Exception:  # noqa: BLE001 - salvage must never block startup
-                log.exception("could not salvage %s", run_id)
-                self.storage.add_event(
-                    f"could not analyse the interrupted run {run_id}; its samples "
-                    "and video are still on disk",
-                    level="error", source="runner", run_id=run_id)
+                        f"could not analyse run {run_id}; its samples and video "
+                        "are still on disk",
+                        level="error", source="runner", run_id=run_id)
 
         threading.Thread(target=salvage, name="salvage", daemon=True).start()
 
@@ -426,6 +452,22 @@ class SurveyRunner:
         Split out from :meth:`stop_run` so a finished run can be re-analysed
         after the thresholds change, without re-walking the garage.
         """
+        with self._lock:
+            self._analysing += 1
+        try:
+            return self._analyse_run(run_id, video_dir, segments)
+        finally:
+            with self._lock:
+                self._analysing -= 1
+
+    @property
+    def analysing(self) -> bool:
+        """Whether a walk is being analysed. An update now would lose it."""
+        with self._lock:
+            return self._analysing > 0
+
+    def _analyse_run(self, run_id: str, video_dir: Path | None,
+                     segments: list | None) -> dict:
         config = self.config["deadzone"]
         samples = list(self.storage.iter_samples(run_id))
         # Dead zones are judged only on the seconds the rig was not loading
@@ -815,16 +857,21 @@ class SurveyRunner:
         that were queued behind the last burst for the entire gap, so the
         gap is never clean: the phone showed bad reception in a good spot
         for nearly the whole walk, and the report judged the gaps on loss the
-        test had caused. Pings sent before the test let go are left out.
+        test had caused. So the reading is taken over the last window's worth
+        of pings sent while the uplink was quiet, reaching back past the
+        burst for them: every second is smoothed over the same number of
+        pings, before a burst or after it.
 
-        A second with no such ping yet is not judged at all, because a reading
+        A second with no such ping at all is not judged, because a reading
         made of nothing would count as a usable second.
         """
-        quiet_since = self.udp_up.quiet_since if self.udp_up.enabled else 0.0
-        if not quiet_since or now - self.ping.window_s >= quiet_since:
+        if not self.udp_up.enabled:
             return ping, 0
         try:
-            clean = self.ping.snapshot(now, since=quiet_since)
+            spans = self.udp_up.loaded_spans()
+            if not any(end > now - self.ping.window_s for _, end in spans):
+                return ping, 0
+            clean = self.ping.snapshot(now, exclude=spans)
         except Exception:  # noqa: BLE001 - never lose a sample to this
             log.exception("could not separate ping from the uplink test")
             return ping, 0
@@ -931,6 +978,9 @@ class SurveyRunner:
             "paused": self.paused,
             "health": self.health(),
             "wrapup": self._wrapup,
+            # End analyses the walk after the run has stopped; the phone says
+            # so, or it looks finished and somebody switches the rig off.
+            "analysing": self.analysing,
             "workers": {worker.name: worker.status() for worker in self.workers},
             "iperf_budget_remaining_mb": self.iperf.budget_remaining_mb,
             "uplink_schedule": self.uplink_schedule(),
@@ -978,6 +1028,12 @@ class SurveyRunner:
         ping = self.ping
         if not ping.enabled:
             link_state, link_detail = "off", "disabled in config"
+        elif (ping.state == "degraded"
+              and (self._last_sample or {}).get("testing")):
+            # Ping going quiet inside one of the rig's own uplink bursts is
+            # the burst's doing. A full-width red alert for it would cry wolf
+            # on every walk.
+            link_state, link_detail = "idle", "paused for uplink test"
         elif ping.state in ("failed", "degraded"):
             link_state = "fail"
             link_detail = ping.error or "no replies"

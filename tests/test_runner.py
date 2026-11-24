@@ -591,7 +591,8 @@ def test_no_second_clip_is_cut_where_a_dead_zone_already_has_one(runner, storage
 def test_an_uplink_clip_window_never_exceeds_a_minute(runner, storage, monkeypatch):
     """Whatever the data says. Every clip is cut on the Pi and uploaded over
     cellular; an hour-long one blocked a re-analysis for minutes."""
-    _store_bursts(storage, "r1", [None], block=90, idle=5)
+    # The burst ends half a minute before End, so it is not one End cut off.
+    _store_bursts(storage, "r1", [None], block=90, idle=30)
     runner.config._data["deadzone"]["pre_roll_s"] = 300
     windows = []
 
@@ -616,20 +617,21 @@ def test_an_uplink_clip_window_never_exceeds_a_minute(runner, storage, monkeypat
 # test, and the report did not.
 
 def _ping(runner, monkeypatch, whole, clean=None):
-    """Make ping report ``whole``, or ``clean`` when asked for pings sent after
-    the uplink test let go."""
+    """Make ping report ``whole``, or ``clean`` when asked to leave out the
+    pings the uplink test held up."""
     runner.ping.enabled = True
     monkeypatch.setattr(runner.ping, "snapshot",
-                        lambda now=None, since=None: dict(clean if since and clean is not None
-                                                          else whole))
+                        lambda now=None, since=None, exclude=None: dict(
+                            clean if (since or exclude) and clean is not None else whole))
 
 
 def _uplink(runner, monkeypatch, state, quiet_since=0.0):
+    """The uplink test in ``state``; its last burst let go at ``quiet_since``."""
     runner.udp_up.enabled = True
     monkeypatch.setattr(runner.udp_up, "start", lambda: None)
     monkeypatch.setattr(type(runner.udp_up), "load_state", property(lambda self: state))
-    monkeypatch.setattr(type(runner.udp_up), "quiet_since",
-                        property(lambda self: quiet_since))
+    spans = [(quiet_since - 23.0, quiet_since)] if quiet_since else []
+    monkeypatch.setattr(runner.udp_up, "loaded_spans", lambda: spans)
 
 
 BURST = {"rtt_ms": 1400.0, "loss_pct": 100.0, "jitter_ms": 300.0, "sent": 10}
@@ -693,7 +695,7 @@ def test_the_phone_and_the_report_give_the_same_numbers(runner, monkeypatch):
     readings = {"now": CLEAN}
     runner.ping.enabled = True
     monkeypatch.setattr(runner.ping, "snapshot",
-                        lambda now=None, since=None: dict(readings["now"]))
+                        lambda now=None, since=None, exclude=None: dict(readings["now"]))
     clock = {"t": 1_800_000_000.0}
     monkeypatch.setattr("viabot_survey.runner.time.time", lambda: clock["t"])
 
@@ -723,3 +725,75 @@ def test_a_live_count_that_fails_never_stops_sampling(runner, monkeypatch):
     runner.collect_sample()
     assert runner.run_summary()["dead_zone_estimate"] == 0
     runner.stop_run()
+
+
+# ---- a walk the power was cut on after End -----------------------------------
+
+def test_a_run_that_ended_but_was_never_analysed_is_analysed_at_startup(config, storage):
+    """End records the end and then cuts clips. Power cut or an update in that
+    window left a closed run with no summary, no dead zones and no report."""
+    from viabot_survey.runner import SurveyRunner
+    base = time.time() - 600
+    storage.create_run("cut-after-end", label="Level 2", started_at=base)
+    for i in range(30):
+        storage.add_sample("cut-after-end", base + i, rtt_ms=45.0, loss_pct=0.0,
+                           status="good", uplink_loaded=0)
+    storage.end_run("cut-after-end")
+    assert storage.get_run("cut-after-end")["summary_json"] is None
+
+    survey = SurveyRunner(config, storage)
+    survey.start()
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline and not storage.get_run("cut-after-end")["summary_json"]:
+            time.sleep(0.1)
+        assert storage.get_run("cut-after-end")["summary_json"]
+    finally:
+        survey.shutdown()
+
+
+def test_old_runs_that_were_never_analysed_are_left_alone(config, storage):
+    from viabot_survey.runner import SurveyRunner
+    base = time.time() - 30 * 86400
+    storage.create_run("ancient", label="Level 2", started_at=base)
+    storage.end_run("ancient")
+    survey = SurveyRunner(config, storage)
+    survey.start()
+    time.sleep(0.5)
+    survey.shutdown()
+    assert storage.get_run("ancient")["summary_json"] is None
+
+
+def test_an_update_is_refused_while_a_walk_is_being_analysed(client, runner):
+    runner._analysing = 1
+    response = client.post("/api/update/apply")
+    assert response.status_code == 409
+    assert "analysing" in response.get_json()["error"]
+    runner._analysing = 0
+
+
+def test_ping_going_quiet_inside_a_burst_is_not_a_link_alarm(runner, monkeypatch):
+    from viabot_survey.workers.base import STATE_DEGRADED
+    runner.ping.enabled = True
+    runner.ping._set_state(STATE_DEGRADED, "no reply for 7s")
+    runner._last_sample = {"testing": True}
+    assert runner.health()["link"] == {"state": "idle", "detail": "paused for uplink test"}
+    runner._last_sample = {"testing": False}
+    assert runner.health()["link"]["state"] == "fail"
+
+
+def test_inside_a_burst_the_link_witness_is_the_last_believable_reading(runner):
+    runner.ping.enabled = True
+    runner._last_sample = {"testing": True, "loss_pct": 100.0, "status": "dead"}
+    runner._last_judged = {"status": "good", "loss_pct": 0.0, "rtt_ms": 45.0,
+                           "ts": time.time() - 10}
+    assert runner._link_quality() == "good"
+    runner._last_judged["ts"] = time.time() - 120
+    assert runner._link_quality() is None
+
+
+def test_the_phone_is_told_while_a_walk_is_being_analysed(runner):
+    runner._analysing = 1
+    assert runner.status()["analysing"] is True
+    runner._analysing = 0
+    assert runner.status()["analysing"] is False

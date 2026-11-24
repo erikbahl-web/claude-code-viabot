@@ -502,11 +502,16 @@ test; the report never did. Worse, ping is averaged over `window_s` (10 s), and
 at 20/10 the gap after a burst is about that long, so the window still held
 queued pings for the *whole* gap and no second was ever clean. Now:
 
-- `PingWorker` records when each ping was *sent*, and `snapshot(since=...)`
-  leaves out pings sent before the uplink test let go (`UdpLoadWorker.quiet_since`).
-  The sampler uses that for every second after a burst; a second with no such
-  ping yet is stored as settling and not judged, because a reading made of
-  nothing would count as usable.
+- `PingWorker` records when each ping was *sent*, and `snapshot(exclude=...)`
+  takes the last window's worth of pings sent outside the stretches the uplink
+  test held the link (`UdpLoadWorker.loaded_spans()`), reaching back past a
+  burst for them. That is **judged time**: every second is smoothed over the
+  same ten pings whether it is next to a burst or not. A first version cut the
+  window at the end of the burst instead, so the seconds just after one were
+  judged on one or two pings and five lost in a row there made a dead zone that
+  took ten seconds anywhere else. The "no reply at all" override counts judged
+  silence too. A second with no clean ping at all is stored as settling and not
+  judged, because a reading made of nothing would count as usable.
 - Seconds inside a burst neither add to nor end the dead streak behind the
   banner's DEAD ZONE, the same way the report stitches across them.
 - The banner shows **UPLINK TEST** in a colour off the quality scale, with the
@@ -519,6 +524,39 @@ queued pings for the *whole* gap and no second was ever clean. Now:
 
 The cost is honest but real: at 20/10 the banner reads UPLINK TEST for most of
 a walk, and dead zones are judged on roughly a fifth of it.
+
+**Dead zones are measured in judged time as well.** `deadzones.measurable()`
+records a running total of the loaded seconds dropped (`loaded_total_s`), and
+`_gap` subtracts every loaded second between two samples, not only the ones
+directly before the second. The five-second minimum is judged seconds: one bad
+second either side of a burst used to come out as a 25-second dead zone with two
+seconds of evidence, and whether a zone was found at all could hang on one good
+second after a burst. "Lasted" stays wall clock, because that is the stretch of
+video the clip covers.
+
+**A segment cut short by Pause ends when it ended.** `plan_clip` used to assume
+every file was a full `segment_s`, so a clip whose pre-roll reached back into a
+pause began a minute late. A segment now ends at the earliest of its full
+length, the next segment's start and its file's modification time, and a cut's
+length is counted in video time (`covered_seconds`), since a pause leaves no
+video.
+
+**End is not finished until the result appears.** `stop_run` marks the run
+ended and then analyses it, cutting clips, inside the same request. The phone
+now shows "Finishing the walk" with a don't-switch-off line for that time
+(`status()["analysing"]`), Apply update is refused while it lasts, and a run
+that ended but was never analysed (power cut or restart in that window) is
+analysed at the next start, for runs from the last week.
+
+**What iperf3 prints at the edges.** Loss is printed with `%.2g`, so 99.5% and
+up is `1e+02` and tiny losses `1e-05`: `RECEIVER_RE` accepts both, or the worst
+second of every collapse is dropped from both directions. A second in which
+nothing arrived is `0/0 (0%)`; it is not a reading (iperf3 books the loss to the
+next second that receives anything), so uplink drops it and downlink clears its
+last reading rather than carrying a clean one forward. The server's relayed
+lines are not counted against `run_data_budget_mb` a second time, and the budget
+is per direction: downlink at 5 Mbit/s spends about 2.2 GB an hour, which is why
+the default went from 2000 (56 minutes) to 10000.
 
 **Pause means "this time did not happen".** It stops measuring and recording
 both, so paused seconds leave no samples and no video. That is what makes the

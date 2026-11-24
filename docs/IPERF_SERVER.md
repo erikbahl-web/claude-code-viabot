@@ -77,9 +77,11 @@ with the load test, so a rate at or above what the link can carry manufactures
 dead zones the garage did not cause. To ask whether a spot could carry 5 Mbit/s
 without disturbing a survey, use `./scripts/capacity_test.sh --udp 5M`.
 
-**The burst schedule** exists for the same reason. The test sends for 10 seconds
-then stays quiet for 20, and the loaded seconds are excluded from dead-zone
-detection. [CODE-TOUR.md](CODE-TOUR.md#excluded-seconds) explains why in full.
+**The burst schedule** exists for the same reason. The test sends for 20 seconds
+then stays quiet for 10 (10 and 20 until 2026-11-22), and the loaded seconds are
+excluded from dead-zone detection. Leave `uplink_block_s` and `uplink_idle_s`
+out of the rig's own `config.yaml` so it follows the repository's schedule; the
+phone's Rig detail shows the one in force. [CODE-TOUR.md](CODE-TOUR.md#excluded-seconds) explains why in full.
 
 **`downlink_bitrate: 5M`** is not a model of anything. The real command stream
 is 64 kbit/s. It is a headroom check, affordable only because downlink measured
@@ -87,13 +89,15 @@ is 64 kbit/s. It is a headroom check, affordable only because downlink measured
 
 ## Data cost
 
-The uplink test at 3 Mbit/s on a one-in-three duty cycle spends roughly 1
-Mbit/s averaged, so about 225 MB for a 30-minute walk. Downlink at 5 Mbit/s runs
+The uplink test at 3 Mbit/s for two thirds of the time spends roughly 2 Mbit/s
+averaged, so about 450 MB for a 30-minute walk. Downlink at 5 Mbit/s runs
 continuously, which is roughly 1.1 GB for the same walk and is server egress.
 
-`run_data_budget_mb` stops launching tests once one run has moved that much. It
-is a runaway guard rather than a cost control, so set it well above what a real
-walk spends. Hitting it mid-walk leaves the rest of the garage unmeasured.
+`run_data_budget_mb` stops launching tests once one run has moved that much in
+one direction. It is a runaway guard rather than a cost control, so set it well
+above what a real walk spends. Hitting it mid-walk leaves the rest of the garage
+unmeasured: the old 2000 stopped downlink 56 minutes into a walk, which is why
+the default is now 10000.
 
 ## Authentication, and the three ways it fails
 

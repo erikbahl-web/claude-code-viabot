@@ -1153,3 +1153,59 @@ def test_a_burst_is_dated_from_when_it_began_not_from_its_first_line(monkeypatch
     launched = time.time()
     _run_fake_block(worker, monkeypatch, f"sleep 0.3; echo '{SENDER_LINE}'")
     assert worker._sending_from == pytest.approx(launched + 0.3 - 1.0, abs=0.25)
+
+
+# ---- what iperf3 really prints at the edges ---------------------------------
+
+def test_a_second_with_almost_everything_lost_is_read_not_dropped():
+    """iperf3 prints loss with %.2g, so 99.5% and over is "1e+02". Missing it
+    dropped the worst second of every collapse, from both directions."""
+    worst = parse_interval(
+        "[  5]   3.00-4.00   sec  1.17 KBytes  9.60 Kbits/sec  0.512 ms  311/312 (1e+02%)  ")
+    assert worst is not None and worst["loss_pct"] == 100.0 and worst["total"] == 312
+    tiny = parse_interval(
+        "[  5]   3.00-4.00   sec   366 KBytes  3.00 Mbits/sec  0.512 ms  1/100000 (1e-05%)  ")
+    assert tiny is not None and tiny["loss_pct"] == pytest.approx(1e-05)
+
+
+def test_an_uplink_second_in_which_nothing_arrived_has_no_reading():
+    """The server prints "0/0 (0%)" for it. Kept, it was stored as a clean
+    second in exactly the seconds the link failed."""
+    text = SERVER_OUTPUT.replace(
+        "[  5]   1.00-2.00   sec   100 KBytes   820 Kbits/sec  8.244 ms  19/104 (18%)",
+        "[  5]   1.00-2.00   sec  0.00 Bytes  0.00 bits/sec  8.244 ms  0/0 (0%)")
+    readings = parse_server_output(text)
+    assert [r["start_s"] for r in readings] == [0.0]
+
+
+def test_the_servers_lines_are_not_counted_against_the_budget_twice():
+    worker = UdpLoadWorker("10.0.0.1", UPLINK)
+    worker._launch_reset = None
+    worker._in_server_output = False
+    for line in SERVER_OUTPUT.splitlines():
+        worker._consume(line)
+    sent_only = sum(parse_interval(l)["bytes"] for l in SERVER_OUTPUT.split("Server output:")[0].splitlines()
+                    if parse_interval(l))
+    assert worker._run_bytes == sent_only
+
+
+def test_a_collapsed_downlink_stops_reporting_its_last_good_second_at_once(monkeypatch):
+    worker = UdpLoadWorker("10.0.0.1", DOWNLINK)
+    script = "printf '%s\\n%s\\n' \"$0\" \"$1\"; sleep 0.2"
+    monkeypatch.setattr(worker, "build_command",
+                        lambda: ["sh", "-c", script, RECEIVER_LINE, EMPTY_SECOND])
+    monkeypatch.setattr(worker, "build_env", lambda: None)
+    worker._run_stream()
+    assert worker.sample_fields()["udp_down_loss_pct"] is None
+
+
+def test_the_stretches_the_test_held_the_uplink_are_remembered(monkeypatch):
+    worker = UdpLoadWorker("10.0.0.1", UPLINK, block_s=10, idle_s=0, settle_s=3,
+                           on_backfill=lambda rows: None)
+    assert worker.loaded_spans() == []
+    _run_fake_block(worker, monkeypatch, f"echo '{SENDER_LINE}'")
+    spans = worker.loaded_spans()
+    assert len(spans) == 1
+    start, end = spans[0]
+    assert end - start == pytest.approx(3.0 + 1.0, abs=0.5)     # one second sent, 3 settling
+    assert UdpLoadWorker("10.0.0.1", DOWNLINK).loaded_spans() == []

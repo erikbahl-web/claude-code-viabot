@@ -197,3 +197,40 @@ def test_a_late_reply_replaces_its_no_answer_and_its_send_time():
     snapshot = worker.snapshot(now=now + 2)
     assert snapshot["loss_pct"] == 0.0
     assert worker._results[1]["sent"] == pytest.approx(now, abs=0.01)
+
+
+def test_every_judged_second_is_smoothed_over_the_same_number_of_pings():
+    """Judged time: the last window's worth of pings sent while the uplink was
+    quiet, reaching back past the burst. Truncating at the end of a burst
+    judged the first seconds after it on one or two pings, so five lost in a
+    row there made a dead zone that took far longer anywhere else."""
+    now = time.time()
+    lines = [(i + 0.05, f"64 bytes from 8.8.8.8: icmp_seq={i} ttl=117 time=45.0 ms")
+             for i in range(8)]                                  # quiet, all answered
+    lines += [(8 + i + 1.0, f"no answer yet for icmp_seq={8 + i}") for i in range(23)]
+    lines += [(31 + i + 1.0, f"no answer yet for icmp_seq={31 + i}") for i in range(5)]
+    burst = [(now + 8, now + 31)]                                # sent in here: the test's
+
+    def reading_at(t):
+        worker = make_worker(window_s=10)
+        _feed(worker, now, [line for line in lines if line[0] <= t])
+        return worker.snapshot(now=now + t, exclude=burst)
+
+    # Three seconds after the burst, three clean pings are known lost (each
+    # is reported one interval after it went): 3 of the last 10 clean pings,
+    # exactly what three lost pings read as anywhere else, not 100%.
+    early = reading_at(34)
+    assert early["sent"] == 10
+    assert early["loss_pct"] == 30.0
+    # The "no reply at all" override counts judged silence only, so it fires
+    # once more than five seconds have passed with no reply outside the burst,
+    # the same as it does away from one, and not before.
+    assert reading_at(36.5)["loss_pct"] == 100.0
+    assert reading_at(32.5)["loss_pct"] < 100.0
+
+
+def test_pings_older_than_the_horizon_are_not_reached_for():
+    worker = make_worker(window_s=10)
+    now = time.time()
+    _feed(worker, now, [(0.05, "64 bytes from 8.8.8.8: icmp_seq=1 ttl=117 time=45.0 ms")])
+    assert worker.snapshot(now=now + 300, exclude=[(now + 1, now + 2)])["sent"] == 0

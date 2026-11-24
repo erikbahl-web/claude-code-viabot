@@ -343,3 +343,71 @@ def test_a_walk_with_no_load_test_is_unaffected():
     column entirely — SQLite fills those rows with NULL."""
     samples = walk("ggggdddddddgggg")
     assert deadzones.measurable(samples, CONFIG) == samples
+
+
+# ---- judged time, not wall-clock time ---------------------------------------
+#
+# Found 2026-11-24 by a review. A zone stitched across an uplink burst was
+# measured on the wall clock, which includes the twenty-odd seconds nobody
+# could judge, and the loaded seconds were only subtracted when they sat
+# directly before the next bad stretch.
+
+BURST = "L" * 23
+
+
+def test_one_bad_second_either_side_of_a_burst_is_not_a_dead_zone():
+    """Two seconds of evidence used to come out as a 25-second dead zone."""
+    zones = find_dead_zones(deadzones.measurable(walk("gggd" + BURST + "dggg"), CONFIG),
+                            CONFIG)
+    assert zones == []
+
+
+def test_enough_bad_seconds_either_side_of_a_burst_still_make_one_zone():
+    zones = find_dead_zones(deadzones.measurable(walk("gddd" + BURST + "dddg"), CONFIG),
+                            CONFIG)
+    assert len(zones) == 1
+    assert zones[0].sample_count == 6
+
+
+def test_whether_a_zone_is_found_does_not_hang_on_one_second():
+    """Bad, burst, one good second, bad again: the burst between the two bad
+    stretches is not walking time either, wherever it falls."""
+    with_good = find_dead_zones(
+        deadzones.measurable(walk("gddd" + BURST + "gddd" + "ggggggggggg"), CONFIG), CONFIG)
+    without = find_dead_zones(
+        deadzones.measurable(walk("gddd" + BURST + "dddd" + "ggggggggggg"), CONFIG), CONFIG)
+    assert len(with_good) == len(without) == 1
+
+
+# ---- clips after a pause -----------------------------------------------------
+
+def test_a_segment_cut_short_by_pause_ends_when_it_ended(tmp_path):
+    """Pause closes a segment early and Resume names the next one for the wall
+    clock. Assuming every file is a full five minutes put footage after a
+    pause at the wrong offset, a minute late."""
+    import os
+    first, second = tmp_path / "a.mkv", tmp_path / "b.mkv"
+    first.write_bytes(b"x"), second.write_bytes(b"x")
+    os.utime(first, (BASE + 100, BASE + 100))         # recorded 100 s, then Pause
+    os.utime(second, (BASE + 400, BASE + 400))
+    segments = [("a.mkv", BASE), ("b.mkv", BASE + 160)]   # Resume at +160
+
+    # A window whose pre-roll reaches back into the pause.
+    spans = plan_clip(segments, tmp_path, BASE + 151, BASE + 190, 300)
+    assert [s.path.name for s in spans] == ["b.mkv"]
+    assert spans[0].offset_s == 0.0
+    assert deadzones.covered_seconds(spans, BASE + 151, BASE + 190) == 30.0
+
+
+def test_footage_either_side_of_a_pause_is_measured_in_video_time(tmp_path):
+    import os
+    first, second = tmp_path / "a.mkv", tmp_path / "b.mkv"
+    first.write_bytes(b"x"), second.write_bytes(b"x")
+    os.utime(first, (BASE + 100, BASE + 100))
+    os.utime(second, (BASE + 400, BASE + 400))
+    segments = [("a.mkv", BASE), ("b.mkv", BASE + 160)]
+    spans = plan_clip(segments, tmp_path, BASE + 90, BASE + 170, 300)
+    assert [s.path.name for s in spans] == ["a.mkv", "b.mkv"]
+    assert spans[0].offset_s == 90.0
+    # 10 s before the pause and 10 s after it; the minute of pause is not video.
+    assert deadzones.covered_seconds(spans, BASE + 90, BASE + 170) == 20.0

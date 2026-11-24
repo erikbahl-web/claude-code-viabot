@@ -169,8 +169,8 @@ class PingWorker(Worker):
 
     # -- readings ------------------------------------------------------------
 
-    def snapshot(self, now: float | None = None,
-                 since: float | None = None) -> dict[str, Any]:
+    def snapshot(self, now: float | None = None, since: float | None = None,
+                 exclude: list[tuple[float, float]] | None = None) -> dict[str, Any]:
         """The last ``window_s`` of pings, summarised.
 
         ``since`` leaves out every ping sent before it. The sampler passes the
@@ -186,8 +186,21 @@ class PingWorker(Worker):
         # reading it in a loop raised "OrderedDict mutated during iteration"
         # about once in two minutes on a busy machine, costing a sample or a
         # status reply each time.
-        window = [e for e in list(self._results.values()) if e["ts"] >= cutoff
-                  and (since is None or e.get("sent", e["ts"]) >= since)]
+        entries = list(self._results.values())
+        if exclude:
+            # Judged time. The last window's worth of pings *sent while the
+            # uplink was quiet*, reaching back past a burst for them if need
+            # be, so every second is smoothed over the same number of pings.
+            # Truncating at the end of a burst instead judged the first
+            # seconds after it on one or two pings: five lost in a row there
+            # made a dead zone that took eight anywhere else.
+            per = max(1, int(round(self.window_s / self.interval_s)))
+            horizon = now - max(4 * self.window_s, 45.0)
+            window = [e for e in entries if e["ts"] >= horizon and not any(
+                start <= e.get("sent", e["ts"]) < end for start, end in exclude)][-per:]
+        else:
+            window = [e for e in entries if e["ts"] >= cutoff
+                      and (since is None or e.get("sent", e["ts"]) >= since)]
         rtts = [e["rtt"] for e in window if e["rtt"] is not None]
 
         loss_pct: float | None = None
@@ -204,7 +217,15 @@ class PingWorker(Worker):
         # If nothing has arrived at all for several intervals the link is down,
         # not merely quiet — say so rather than reporting a stale RTT.
         silent_for = None if self._last_reply_ts is None else round(now - self._last_reply_ts, 1)
-        if silent_for is not None and silent_for > max(5 * self.interval_s, 5.0):
+        # In judged time, silence the uplink test caused is not silence: a
+        # burst that dropped every ping would otherwise force 100% loss onto
+        # the clean seconds after it, for as long as the burst had lasted.
+        judged_silence = silent_for
+        if exclude and silent_for is not None:
+            last = self._last_reply_ts
+            held = sum(max(0.0, min(end, now) - max(start, last)) for start, end in exclude)
+            judged_silence = round(max(0.0, silent_for - held), 1)
+        if judged_silence is not None and judged_silence > max(5 * self.interval_s, 5.0):
             latest = None
             loss_pct = 100.0
             if self.state not in (STATE_FAILED,):

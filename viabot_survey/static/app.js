@@ -186,7 +186,9 @@
     var run = data.run;
     var wrapup = data.wrapup;
 
-    el("paneIdle").hidden = !!run || !!wrapup;
+    var finishing = !run && !wrapup && !!data.analysing;
+    el("paneIdle").hidden = !!run || !!wrapup || finishing;
+    el("paneFinishing").hidden = !finishing;
     el("paneRunning").hidden = !run;
     el("paneWrapup").hidden = !!run || !wrapup;
 

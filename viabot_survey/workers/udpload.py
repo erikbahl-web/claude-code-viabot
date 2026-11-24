@@ -71,7 +71,10 @@ RECEIVER_RE = re.compile(
     r"(?P<transfer>[\d.]+)\s+(?P<transfer_unit>[KMGT]?)Bytes\s+"
     r"(?P<rate>[\d.]+)\s+(?P<rate_unit>[KMGT]?)bits/sec\s+"
     r"(?P<jitter>[\d.]+)\s+ms\s+"
-    r"(?P<lost>\d+)/(?P<total>\d+)\s+\((?P<loss_pct>[\d.]+)%\)\s*$"
+    # iperf3 prints the percentage with %.2g, so 99.5% and over comes out as
+    # "1e+02" and very small losses as "1e-05". Missing that dropped the worst
+    # second of every collapse from both directions.
+    r"(?P<lost>\d+)/(?P<total>\d+)\s+\((?P<loss_pct>[\d.]+(?:[eE][+-]?\d+)?)%\)\s*$"
 )
 
 #: The sending end's line has no jitter or loss — only what it put on the wire:
@@ -443,7 +446,13 @@ def parse_server_output(text: str) -> list[dict[str, Any]]:
     readings = []
     for line in tail.splitlines():
         reading = parse_interval(line)
-        if reading and reading.get("loss_pct") is not None:
+        # A second in which nothing arrived prints "0/0 (0%)": none of
+        # nothing was lost. Kept, it was stored as a clean, loss-free second
+        # in exactly the seconds the link failed; left out, the second has no
+        # reading and the report counts it as sent with nothing arriving. The
+        # datagrams it lost are booked by iperf3 against the next second that
+        # receives anything.
+        if reading and reading.get("loss_pct") is not None and reading.get("total"):
             readings.append(reading)
     return readings
 
@@ -503,6 +512,8 @@ class UdpLoadWorker(Worker):
         # When this worker was last started, so that a direction which never
         # reports at all does not sit on "first test running" for a whole walk.
         self._started_at: float | None = None
+        # Past "Server output:" in this attempt's output.
+        self._in_server_output = False
         # Set by the stall watchdog once it has said why it killed a test, so
         # the reader does not then report the same death as "no readings".
         self._stalled = False
@@ -511,6 +522,10 @@ class UdpLoadWorker(Worker):
         # Wall clock through which this worker's own traffic still owns the
         # uplink: until then, nothing ping says is about the garage alone.
         self._load_until: float = 0.0
+        # (start, end) of the last few stretches this test held the uplink,
+        # settling included, and the start of the one in progress.
+        self._loaded_spans: deque[tuple[float, float]] = deque(maxlen=8)
+        self._span_start: float | None = None
         self._sending_from: float = 0.0
         self._sending_until: float = 0.0
         self._last_output_ts: float = 0.0
@@ -596,6 +611,7 @@ class UdpLoadWorker(Worker):
         self._last_output_ts = time.time()
         self._stalled = False
         self._engaged = False
+        self._in_server_output = False
         self._attempt_link = {LINK_GOOD: 0, LINK_POOR: 0, LINK_DEAD: 0}
         self._watch_for_stall(self._proc)
         return self._proc
@@ -840,6 +856,10 @@ class UdpLoadWorker(Worker):
                         # itself when the link returns and a reconnect from
                         # inside a dead zone can find the server still holding
                         # the old test. But the phone is told.
+                        # The last real reading is over now, not in three
+                        # seconds' time: carried forward, it painted the
+                        # first seconds of every collapse as clean.
+                        self._latest = None
                         empty_since = empty_since or time.time()
                         if time.time() - empty_since >= STALE_DOWNLINK_OUTCOME_S:
                             self._note_trouble(
@@ -936,6 +956,7 @@ class UdpLoadWorker(Worker):
                     # places it is there for. It also counted every handshake
                     # as a second in which the rig "sent and nothing arrived".
                     sending_from = began
+                    self._span_start = sending_from
                     self._sending_from = sending_from
                     self._sending_until = sending_from + self.block_s
                     self._load_until = self._sending_until + self.settle_s
@@ -951,6 +972,8 @@ class UdpLoadWorker(Worker):
                 now = time.time()
                 self._sending_until = min(self._sending_until, now)
                 self._load_until = now + self.settle_s
+                self._loaded_spans.append((sending_from, self._load_until))
+            self._span_start = None
 
         # A test the watchdog killed has already been explained, and reading
         # its output again would only replace that with "no readings". One
@@ -1016,6 +1039,8 @@ class UdpLoadWorker(Worker):
         # Any output at all, parseable or not, means the test is still alive.
         self._last_output_ts = time.time()
         self._last_line = line.strip() or self._last_line
+        if "Server output:" in line:
+            self._in_server_output = True
         reading = parse_interval(line)
         if reading is None:
             # "[  5] local ... connected to ..." is the first line that needs
@@ -1025,8 +1050,12 @@ class UdpLoadWorker(Worker):
                 self._engaged = True
             return None
         self._engaged = True
-        self._run_bytes += reading["bytes"]
-        self._total_bytes += reading["bytes"]
+        # The server's own lines, relayed after "Server output:", describe the
+        # same datagrams again. Counting them too spent the data budget twice
+        # as fast as the link did.
+        if not self._in_server_output:
+            self._run_bytes += reading["bytes"]
+            self._total_bytes += reading["bytes"]
         return reading
 
     def _terminate(self) -> None:
@@ -1070,6 +1099,19 @@ class UdpLoadWorker(Worker):
             return LOAD_IDLE
         sending = self._sending_from <= now < self._sending_until
         return LOAD_SENDING if sending else LOAD_SETTLING
+
+    def loaded_spans(self) -> list[tuple[float, float]]:
+        """Every recent stretch this test held the uplink, settling included.
+
+        A ping sent inside one queued behind the test and says nothing about
+        the place. The one in progress has no end yet.
+        """
+        if self.direction != UPLINK:
+            return []
+        spans = list(self._loaded_spans)
+        if self._span_start is not None:
+            spans.append((self._span_start, float("inf")))
+        return spans
 
     @property
     def quiet_since(self) -> float:

@@ -165,7 +165,7 @@ def quality_stats(samples: Sequence[dict]) -> dict[str, Any]:
 
 
 def _absent_reason(direction: str, walked_s: int, block_s: float,
-                   idle_s: float = 0.0) -> str:
+                   idle_s: float = 0.0, sent_unanswered: bool = False) -> str:
     """Why a direction has nothing, in terms of what the operator did.
 
     Uplink loss can only be counted at the far end, so the rig runs a fixed
@@ -179,7 +179,9 @@ def _absent_reason(direction: str, walked_s: int, block_s: float,
     cycle rather than just the block.
     """
     cycle_s = block_s + idle_s
-    if direction == "uplink" and walked_s < cycle_s * 1.5:
+    # A burst that ran its course and got no answer is not a walk that was too
+    # short, however short the walk.
+    if direction == "uplink" and walked_s < cycle_s * 1.5 and not sent_unanswered:
         gap = (f", then stays quiet for {idle_s:g}s so the modem's buffer can "
                "drain" if idle_s else "")
         return (
@@ -265,6 +267,12 @@ def uplink_sending(samples: Sequence[dict]) -> list[bool]:
     failure by one burst is the better mistake.
     """
     mask = [s.get("uplink_loaded") == LOAD_SENDING for s in samples]
+    # A burst stops sending before it reports: its readings come back only
+    # after the end-of-test exchange, a few seconds later on a loaded link.
+    # End or Pause in that window loses them just as surely as End or Pause
+    # inside the burst, and the seconds in between are marked settling, not
+    # sending, so they are stepped over first, up to this long.
+    exchange_grace_s = 10.0
 
     def paused_after(index: int) -> bool:
         if index == len(samples) - 1:
@@ -276,6 +284,15 @@ def uplink_sending(samples: Sequence[dict]) -> list[bool]:
         if not paused_after(end):
             continue
         index = end
+        stopped_at = samples[end].get("ts")
+        while (index >= 0 and not mask[index]
+               and samples[index].get("udp_up_loss_pct") is None
+               and (index == end or not paused_after(index))
+               and stopped_at is not None and samples[index].get("ts") is not None
+               and stopped_at - samples[index]["ts"] <= exchange_grace_s):
+            index -= 1
+        if index >= 0 and index != end and paused_after(index):
+            continue
         while (index >= 0 and mask[index]
                and samples[index].get("udp_up_loss_pct") is None
                and (index == end or not paused_after(index))):
@@ -341,7 +358,9 @@ def load_stats(samples: Sequence[dict],
         if not readings:
             out[name] = {
                 "seconds_measured": 0,
-                "absent_reason": _absent_reason(name, len(samples), block_s, idle_s),
+                "absent_reason": _absent_reason(
+                    name, len(samples), block_s, idle_s,
+                    sent_unanswered=name == "uplink" and any(uplink_sending(samples))),
             }
             continue
         losses = _numbers(readings, prefix + "loss_pct")

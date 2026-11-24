@@ -387,6 +387,18 @@ class Storage:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def unanalysed_runs(self, since_ts: float) -> list[dict]:
+        """Runs that ended without their analysis ever being stored.
+
+        End records the run as ended and then analyses it, which cuts clips
+        and can take a while. Power cut or an update in between, and the run
+        is closed with no summary, no dead zones and no report.
+        """
+        rows = self.connection().execute(
+            "SELECT * FROM runs WHERE ended_at IS NOT NULL AND summary_json IS NULL "
+            "AND started_at >= ? ORDER BY started_at", (since_ts,)).fetchall()
+        return [dict(row) for row in rows]
+
     def active_run(self) -> dict | None:
         row = self.connection().execute(
             "SELECT * FROM runs WHERE ended_at IS NULL ORDER BY started_at DESC LIMIT 1"
