@@ -1,3 +1,4 @@
+import json
 import time
 
 from viabot_survey.runner import classify, slugify
@@ -560,7 +561,10 @@ def test_the_phone_is_told_the_burst_schedule_in_force(runner, monkeypatch):
     """So the owner can confirm from the phone that an update took effect."""
     assert runner.status()["uplink_schedule"] is None      # off in the fixture
     runner.udp_up.enabled = True
-    assert runner.status()["uplink_schedule"] == {"on_s": 20.0, "off_s": 10.0}
+    # And the data cap, which a rig's own config.yaml can still hold at the
+    # old 2000: that stops downlink 56 minutes into a walk.
+    assert runner.status()["uplink_schedule"] == {"on_s": 20.0, "off_s": 10.0,
+                                                  "budget_mb": 10000}
 
 
 def test_no_second_clip_is_cut_where_a_dead_zone_already_has_one(runner, storage,
@@ -590,7 +594,8 @@ def test_no_second_clip_is_cut_where_a_dead_zone_already_has_one(runner, storage
 def test_an_uplink_clip_window_never_exceeds_a_minute(runner, storage, monkeypatch):
     """Whatever the data says. Every clip is cut on the Pi and uploaded over
     cellular; an hour-long one blocked a re-analysis for minutes."""
-    _store_bursts(storage, "r1", [None], block=90, idle=5)
+    # The burst ends half a minute before End, so it is not one End cut off.
+    _store_bursts(storage, "r1", [None], block=90, idle=30)
     runner.config._data["deadzone"]["pre_roll_s"] = 300
     windows = []
 
@@ -604,3 +609,194 @@ def test_an_uplink_clip_window_never_exceeds_a_minute(runner, storage, monkeypat
     assert len(windows) == 1
     start, end = windows[0]
     assert end - start <= 61
+
+
+# ---- the phone during the rig's own uplink test ------------------------------
+#
+# 2026-11-24, office test: the banner showed very bad reception in a spot known
+# to be good, and dead zones during a walk the report then called 100%
+# runnable. The banner, the live dead-zone count and the live percentage all
+# judged ping during the rig's own uplink bursts, when ping queues behind the
+# test, and the report did not.
+
+def _ping(runner, monkeypatch, whole, clean=None):
+    """Make ping report ``whole``, or ``clean`` when asked to leave out the
+    pings the uplink test held up."""
+    runner.ping.enabled = True
+    monkeypatch.setattr(runner.ping, "snapshot",
+                        lambda now=None, since=None, exclude=None: dict(
+                            clean if (since or exclude) and clean is not None else whole))
+
+
+def _uplink(runner, monkeypatch, state, quiet_since=0.0):
+    """The uplink test in ``state``; its last burst let go at ``quiet_since``."""
+    runner.udp_up.enabled = True
+    monkeypatch.setattr(runner.udp_up, "start", lambda: None)
+    monkeypatch.setattr(type(runner.udp_up), "load_state", property(lambda self: state))
+    spans = [(quiet_since - 23.0, quiet_since)] if quiet_since else []
+    monkeypatch.setattr(runner.udp_up, "loaded_spans", lambda: spans)
+
+
+BURST = {"rtt_ms": 1400.0, "loss_pct": 100.0, "jitter_ms": 300.0, "sent": 10}
+CLEAN = {"rtt_ms": 45.0, "loss_pct": 0.0, "jitter_ms": 2.0, "sent": 3}
+
+
+def test_a_second_inside_a_burst_is_shown_as_the_test_not_as_reception(runner, monkeypatch):
+    _uplink(runner, monkeypatch, udpload.LOAD_SENDING)
+    _ping(runner, monkeypatch, BURST)
+    runner._last_judged = {"status": "good", "rtt_ms": 45.0, "loss_pct": 0.0, "ts": 1.0}
+    for _ in range(8):
+        sample = runner.collect_sample()
+    assert sample["testing"] is True
+    assert sample["last_judged"]["status"] == "good"
+    # Eight seconds of total loss inside a burst is not eight seconds of a
+    # dead zone: the streak behind the banner's DEAD ZONE never moved.
+    assert sample["dead_streak_s"] == 0.0
+    assert sample["status"] != "dead"
+
+
+def test_the_gap_after_a_burst_is_judged_only_on_pings_sent_in_it(runner, monkeypatch):
+    _uplink(runner, monkeypatch, udpload.LOAD_IDLE, quiet_since=time.time() - 3)
+    _ping(runner, monkeypatch, whole=BURST, clean=CLEAN)
+    sample = runner.collect_sample()
+    assert sample["testing"] is False
+    assert sample["status"] == "good"
+    assert sample["loss_pct"] == 0.0
+
+
+def test_a_second_with_no_clean_ping_yet_is_not_judged(runner, monkeypatch):
+    """A reading made of nothing would count as a usable second."""
+    _uplink(runner, monkeypatch, udpload.LOAD_IDLE, quiet_since=time.time() - 0.5)
+    _ping(runner, monkeypatch, whole=BURST, clean={"sent": 0, "loss_pct": None, "rtt_ms": None})
+    run_id = runner.start_run(label="Level 2")["id"]
+    sample = runner.collect_sample()
+    runner.stop_run()
+    assert sample["testing"] is True
+    assert sample["uplink_loaded"] == udpload.LOAD_SETTLING
+    assert [r["uplink_loaded"] for r in storage_rows(runner, run_id)] == [udpload.LOAD_SETTLING]
+
+
+def test_long_after_a_burst_the_whole_window_is_used_again(runner, monkeypatch):
+    _uplink(runner, monkeypatch, udpload.LOAD_IDLE, quiet_since=time.time() - 60)
+    _ping(runner, monkeypatch, whole=CLEAN, clean={"sent": 0})
+    sample = runner.collect_sample()
+    assert sample["testing"] is False and sample["status"] == "good"
+
+
+def storage_rows(runner, run_id):
+    return list(runner.storage.iter_samples(run_id))
+
+
+def test_the_phone_and_the_report_give_the_same_numbers(runner, monkeypatch):
+    """The live count and percentage are worked out by the report's own code
+    from the stored samples, so they cannot disagree with it."""
+    monkeypatch.setattr("viabot_survey.runner.LIVE_RECOUNT_S", 0.0)
+    state = {"loaded": udpload.LOAD_IDLE}
+    _uplink(runner, monkeypatch, udpload.LOAD_IDLE)
+    monkeypatch.setattr(type(runner.udp_up), "load_state",
+                        property(lambda self: state["loaded"]))
+    readings = {"now": CLEAN}
+    runner.ping.enabled = True
+    monkeypatch.setattr(runner.ping, "snapshot",
+                        lambda now=None, since=None, exclude=None: dict(readings["now"]))
+    clock = {"t": 1_800_000_000.0}
+    monkeypatch.setattr("viabot_survey.runner.time.time", lambda: clock["t"])
+
+    runner.start_run(label="Level 2")
+    # Clean, then a burst of total loss (the test's doing), then a real
+    # eight-second dead zone, then clean again.
+    plan = ([(udpload.LOAD_IDLE, CLEAN)] * 10 + [(udpload.LOAD_SENDING, BURST)] * 20
+            + [(udpload.LOAD_IDLE, BURST)] * 8 + [(udpload.LOAD_IDLE, CLEAN)] * 10)
+    for loaded, reading in plan:
+        state["loaded"], readings["now"] = loaded, reading
+        runner.collect_sample()
+        clock["t"] += 1.0
+    live = runner.run_summary()
+    result = runner.stop_run()
+    summary = json.loads(result["summary_json"])
+
+    assert live["dead_zone_estimate"] == summary["dead_zone_count"] == 1
+    assert live["runnable_pct"] == summary["runnable_pct"]
+
+
+def test_a_live_count_that_fails_never_stops_sampling(runner, monkeypatch):
+    monkeypatch.setattr("viabot_survey.runner.LIVE_RECOUNT_S", 0.0)
+    _ping(runner, monkeypatch, CLEAN)
+    runner.start_run(label="Level 2")
+    monkeypatch.setattr(runner.storage, "iter_samples",
+                        lambda run_id: (_ for _ in ()).throw(RuntimeError("disk")))
+    runner.collect_sample()
+    assert runner.run_summary()["dead_zone_estimate"] == 0
+    runner.stop_run()
+
+
+# ---- a walk the power was cut on after End -----------------------------------
+
+def test_a_run_that_ended_but_was_never_analysed_is_analysed_at_startup(config, storage):
+    """End records the end and then cuts clips. Power cut or an update in that
+    window left a closed run with no summary, no dead zones and no report."""
+    from viabot_survey.runner import SurveyRunner
+    base = time.time() - 600
+    storage.create_run("cut-after-end", label="Level 2", started_at=base)
+    for i in range(30):
+        storage.add_sample("cut-after-end", base + i, rtt_ms=45.0, loss_pct=0.0,
+                           status="good", uplink_loaded=0)
+    storage.end_run("cut-after-end")
+    assert storage.get_run("cut-after-end")["summary_json"] is None
+
+    survey = SurveyRunner(config, storage)
+    survey.start()
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline and not storage.get_run("cut-after-end")["summary_json"]:
+            time.sleep(0.1)
+        assert storage.get_run("cut-after-end")["summary_json"]
+    finally:
+        survey.shutdown()
+
+
+def test_old_runs_that_were_never_analysed_are_left_alone(config, storage):
+    from viabot_survey.runner import SurveyRunner
+    base = time.time() - 30 * 86400
+    storage.create_run("ancient", label="Level 2", started_at=base)
+    storage.end_run("ancient")
+    survey = SurveyRunner(config, storage)
+    survey.start()
+    time.sleep(0.5)
+    survey.shutdown()
+    assert storage.get_run("ancient")["summary_json"] is None
+
+
+def test_an_update_is_refused_while_a_walk_is_being_analysed(client, runner):
+    runner._analysing = 1
+    response = client.post("/api/update/apply")
+    assert response.status_code == 409
+    assert "analysing" in response.get_json()["error"]
+    runner._analysing = 0
+
+
+def test_ping_going_quiet_inside_a_burst_is_not_a_link_alarm(runner, monkeypatch):
+    from viabot_survey.workers.base import STATE_DEGRADED
+    runner.ping.enabled = True
+    runner.ping._set_state(STATE_DEGRADED, "no reply for 7s")
+    runner._last_sample = {"testing": True}
+    assert runner.health()["link"] == {"state": "idle", "detail": "paused for uplink test"}
+    runner._last_sample = {"testing": False}
+    assert runner.health()["link"]["state"] == "fail"
+
+
+def test_inside_a_burst_the_link_witness_is_the_last_believable_reading(runner):
+    runner.ping.enabled = True
+    runner._last_sample = {"testing": True, "loss_pct": 100.0, "status": "dead"}
+    runner._last_judged = {"status": "good", "loss_pct": 0.0, "rtt_ms": 45.0,
+                           "ts": time.time() - 10}
+    assert runner._link_quality() == "good"
+    runner._last_judged["ts"] = time.time() - 120
+    assert runner._link_quality() is None
+
+
+def test_the_phone_is_told_while_a_walk_is_being_analysed(runner):
+    runner._analysing = 1
+    assert runner.status()["analysing"] is True
+    runner._analysing = 0
+    assert runner.status()["analysing"] is False

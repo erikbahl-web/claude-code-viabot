@@ -112,13 +112,22 @@ def measurable(samples: Sequence[dict], config: dict | None = None) -> list[dict
     """
     if config is not None and not config.get("ignore_loaded_seconds", True):
         return list(samples)
+    if not any(sample.get("uplink_loaded") for sample in samples):
+        return list(samples)
     kept: list[dict] = []
     dropped = 0
+    total = 0
     for sample in samples:
         if sample.get("uplink_loaded"):
             dropped += 1
+            total += 1
             continue
-        kept.append({**sample, "loaded_before_s": float(dropped)} if dropped else sample)
+        # The running total as well as the count just before: two judged
+        # samples further apart than neighbours (a merge across a short good
+        # stretch) can have loaded seconds anywhere between them, not only
+        # directly before the second.
+        kept.append({**sample, "loaded_before_s": float(dropped),
+                     "loaded_total_s": float(total)})
         dropped = 0
     return kept
 
@@ -129,8 +138,11 @@ def _gap(previous: dict, sample: dict) -> float:
     Time the rig spent loading the uplink itself is not a break in the walk,
     only a break in what can be believed about it, so it does not count.
     """
-    return (sample["ts"] - previous["ts"]
-            - float(sample.get("loaded_before_s") or 0.0))
+    if "loaded_total_s" in sample and "loaded_total_s" in previous:
+        loaded = float(sample["loaded_total_s"]) - float(previous["loaded_total_s"])
+    else:
+        loaded = float(sample.get("loaded_before_s") or 0.0)
+    return sample["ts"] - previous["ts"] - loaded
 
 
 def is_unusable(sample: dict, config: dict) -> bool:
@@ -183,7 +195,11 @@ def find_dead_zones(samples: Sequence[dict], config: dict) -> list[DeadZone]:
     for group in merged:
         start_ts = group[0]["ts"]
         end_ts = group[-1]["ts"]
-        if (end_ts - start_ts + SAMPLE_S) < min_duration:
+        # Long enough in *judged* time. The wall clock across a stitch
+        # includes the 20-odd seconds of an uplink burst nobody could judge,
+        # which turned one bad second either side of a burst into a 25-second
+        # dead zone with two seconds of evidence.
+        if _gap(group[0], group[-1]) + SAMPLE_S < min_duration:
             continue
         losses = [s["loss_pct"] for s in group if s.get("loss_pct") is not None]
         rtts = [s["rtt_ms"] for s in group if s.get("rtt_ms") is not None]
@@ -277,6 +293,46 @@ class SegmentSpan:
     start_epoch: float
     #: Seconds into this file where the wanted footage begins.
     offset_s: float
+    #: When this file's footage really ends. Pause stops a segment early, so
+    #: it is not always its start plus the configured segment length.
+    end_epoch: float | None = None
+
+
+def _segment_end(path: Path, start_epoch: float, segment_length_s: float,
+                 next_start: float | None) -> float:
+    """When a segment's footage ends: the earliest of its full length, the
+    next segment's start, and the last time anything was written to it.
+
+    A segment is closed early by Pause and the next one is named for the
+    wall clock at Resume, so assuming every file is a full five minutes put
+    footage from after a pause at the wrong offset: a clip whose pre-roll
+    reached back into the pause began a minute late and missed what it was
+    cut for. The file's modification time is when recording into it stopped.
+    """
+    end = start_epoch + segment_length_s
+    if next_start is not None and next_start > start_epoch:
+        end = min(end, next_start)
+    try:
+        written = path.stat().st_mtime
+    except OSError:
+        return end
+    if start_epoch < written < end:
+        end = written
+    return end
+
+
+def covered_seconds(spans: Sequence["SegmentSpan"], window_start: float,
+                    window_end: float) -> float:
+    """How much footage the spans hold inside the window, in video time.
+
+    A pause leaves no video, so footage either side of one is continuous in
+    the joined file and the wall-clock window would cut past its end.
+    """
+    total = 0.0
+    for span in spans:
+        end = span.end_epoch if span.end_epoch is not None else window_end
+        total += max(0.0, min(window_end, end) - max(window_start, span.start_epoch))
+    return total
 
 
 def plan_clip(segments: Sequence[tuple[str, float]], video_dir: Path,
@@ -288,17 +344,20 @@ def plan_clip(segments: Sequence[tuple[str, float]], video_dir: Path,
     result is a list to be concatenated rather than a single (file, offset).
     """
     spans: list[SegmentSpan] = []
-    for name, start_epoch in segments:
-        end_epoch = start_epoch + segment_length_s
+    ordered = sorted(segments, key=lambda item: item[1])
+    for index, (name, start_epoch) in enumerate(ordered):
+        path = video_dir / name
+        next_start = ordered[index + 1][1] if index + 1 < len(ordered) else None
+        end_epoch = _segment_end(path, start_epoch, segment_length_s, next_start)
         if end_epoch <= window_start or start_epoch >= window_end:
             continue
-        path = video_dir / name
         if not path.exists():
             continue
         spans.append(SegmentSpan(
             path=path,
             start_epoch=start_epoch,
             offset_s=max(0.0, window_start - start_epoch),
+            end_epoch=end_epoch,
         ))
     return spans
 
@@ -333,7 +392,10 @@ def extract_clip(zone: DeadZone, segments: Sequence[tuple[str, float]],
             f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(zone.start_ts))}-"
             f"{int(zone.duration_s)}s.{container}")
     output = output_dir / name
-    duration = window_end - window_start
+    duration = covered_seconds(spans, window_start, window_end)
+    if duration <= 0:
+        zone.clip_error = f"no video covers this {what}"
+        return zone
 
     try:
         if len(spans) == 1:

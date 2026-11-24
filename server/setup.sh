@@ -25,6 +25,7 @@ warn() { printf '    %s!%s %s\n' "$YELLOW" "$OFF" "$*" >&2; }
 die()  { printf '\n%sERROR:%s %s\n' "$RED" "$OFF" "$*" >&2; exit 1; }
 
 DOMAIN=""
+GENERATED=0
 USE_TLS=1
 ROTATE=0
 APP_DIR=/opt/viabot-receiver
@@ -93,6 +94,7 @@ if [[ -f "$ENV_FILE" && $ROTATE -eq 0 ]]; then
   ok "$ENV_FILE exists — leaving it alone (--rotate-secrets to replace)"
 else
   [[ -f "$ENV_FILE" ]] && warn "rotating: every rig will need its config updated"
+  GENERATED=1
   UPLOAD_TOKEN="$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-32)"
   VIEWER_PASSWORD="$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-20)"
   IPERF_PASSWORD="$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-32)"
@@ -284,6 +286,20 @@ curl -fsS --max-time 5 "http://127.0.0.1:8089/healthz" >/dev/null \
 
 # ---------------------------------------------------------------------------
 printf '\n%s==>%s %sSetup complete.%s\n' "$BLUE" "$OFF" "$GREEN" "$OFF"
+# Re-running to install an update is the common case, and its output tends to
+# get pasted somewhere for help. The secrets have not changed, so do not print
+# them again.
+if [[ $GENERATED -eq 0 ]]; then
+  cat <<UNCHANGED
+
+  The secrets are unchanged, so they are not printed again. They are in
+  $ENV_FILE (root only):
+
+      sudo cat $ENV_FILE
+
+UNCHANGED
+  exit 0
+fi
 cat <<SUMMARY
 
   If your provider has its own firewall (Vultr and Linode both do, separate

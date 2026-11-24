@@ -136,7 +136,13 @@ udp_load:
   # Runaway guard, not a cost control — the SIM is unlimited. Set it well above
   # what a real walk spends (bitrate x duration), because hitting it mid-walk
   # stops the measurement and leaves the rest of the garage unmeasured.
-  run_data_budget_mb: 2000
+  #
+  # It is per direction, per run. Downlink runs continuously at 5 Mbit/s, about
+  # 2.2 GB an hour, so the old 2000 stopped it 56 minutes into a walk. 10000 is
+  # about four and a half hours of downlink, and uplink at 3 Mbit/s for two
+  # thirds of the time spends less than half that. If a rig's own config.yaml
+  # still says 2000, that line wins and the limit is still 56 minutes.
+  run_data_budget_mb: 10000
 
   # iperf3's own authentication, shared by both directions. Leave blank only
   # for a server that cannot be reached from the internet — an open one is a

@@ -392,3 +392,16 @@ def test_the_phone_shows_the_uplink_burst_schedule_in_force(client):
     assert '"Uplink test"' in script
     # Still a plain script a captive-portal webview will run.
     assert "import " not in script and "=>" not in script
+
+
+def test_the_phone_says_finishing_rather_than_looking_done(client):
+    """After END the run is over but the result is still being worked out. The
+    phone used to show the START screen at once, which looks finished, and a
+    rig switched off then lost the walk's result."""
+    from pathlib import Path
+    page = client.get("/").get_data(as_text=True)
+    script = (Path(__file__).resolve().parent.parent
+              / "viabot_survey" / "static" / "app.js").read_text()
+    assert 'id="paneFinishing"' in page
+    assert "Don't" in page and "switch the rig off" in page
+    assert "data.analysing" in script and "paneFinishing" in script

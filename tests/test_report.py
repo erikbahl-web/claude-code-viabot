@@ -949,3 +949,31 @@ def test_a_spot_in_a_dead_zone_links_that_zones_clip():
                  page.index("Where the link failed")]
     assert "same place as dead zone 1" in table
     assert 'data-clip="deadzone-01-x-45s.mp4"' in table
+
+
+def test_a_burst_whose_answer_was_lost_to_end_is_not_a_failure():
+    """A burst stops sending before it reports; its readings come back after
+    the end-of-test exchange. End in that window lost them, and the seconds
+    after the burst are marked settling, so the burst used to be counted as
+    sent with nothing arriving and given the first clip."""
+    rows = _marked("RRRR....SSSS")
+    for row in rows[-1:]:
+        pass
+    rows += [dict(rows[-1], ts=rows[-1]["ts"] + i + 1, uplink_loaded=1)
+             for i in range(3)]
+    readings = [r for r in rows if r["udp_up_loss_pct"] is not None]
+    assert report._silent_seconds("uplink", rows, readings) == 0
+
+
+def test_a_burst_that_ended_long_before_end_is_still_a_failure():
+    rows = _marked("RRRR....SSSS" + "." * 20)
+    readings = [r for r in rows if r["udp_up_loss_pct"] is not None]
+    assert report._silent_seconds("uplink", rows, readings) == 4
+
+
+def test_a_short_walk_whose_one_burst_got_no_answer_is_not_called_too_short():
+    stats = report.load_stats(_marked("." * 3 + "S" * 20 + "." * 14),
+                              {"enabled": True, "uplink_block_s": 20, "uplink_idle_s": 10})
+    reason = stats["uplink"]["absent_reason"]
+    assert "cut off before one could" not in reason
+    assert "not one of them reported" in reason
