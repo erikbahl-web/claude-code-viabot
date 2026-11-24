@@ -52,7 +52,7 @@ udp_load:
   downlink_bitrate: 5M
 
   datagram_bytes: 1200
-  run_data_budget_mb: 2000
+  run_data_budget_mb: 10000   # per direction per walk; 2000 stopped downlink at 56 min
 ```
 
 Each direction needs its own port, because one iperf3 server runs one test at a

@@ -561,7 +561,10 @@ def test_the_phone_is_told_the_burst_schedule_in_force(runner, monkeypatch):
     """So the owner can confirm from the phone that an update took effect."""
     assert runner.status()["uplink_schedule"] is None      # off in the fixture
     runner.udp_up.enabled = True
-    assert runner.status()["uplink_schedule"] == {"on_s": 20.0, "off_s": 10.0}
+    # And the data cap, which a rig's own config.yaml can still hold at the
+    # old 2000: that stops downlink 56 minutes into a walk.
+    assert runner.status()["uplink_schedule"] == {"on_s": 20.0, "off_s": 10.0,
+                                                  "budget_mb": 10000}
 
 
 def test_no_second_clip_is_cut_where_a_dead_zone_already_has_one(runner, storage,

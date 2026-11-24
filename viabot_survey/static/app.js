@@ -225,7 +225,12 @@
   function scheduleText(schedule) {
     if (schedule === undefined) return null;
     if (!schedule) return "off";
-    return schedule.on_s + " s on / " + schedule.off_s + " s off";
+    var text = schedule.on_s + " s on / " + schedule.off_s + " s off";
+    // Per direction, per walk. 2000 stops downlink 56 minutes in.
+    if (schedule.budget_mb) {
+      text += ", " + Math.round(schedule.budget_mb / 100) / 10 + " GB cap";
+    }
+    return text;
   }
 
   function renderSystem(system, schedule) {

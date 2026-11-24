@@ -996,7 +996,10 @@ class SurveyRunner:
         worker = self.udp_up
         if not worker.enabled:
             return None
-        return {"on_s": worker.block_s, "off_s": worker.idle_s}
+        # The data budget too: a rig whose own config.yaml still says 2000
+        # stops downlink 56 minutes into a walk, and nothing else shows it.
+        return {"on_s": worker.block_s, "off_s": worker.idle_s,
+                "budget_mb": worker.run_data_budget_mb}
 
     def clear_wrapup(self) -> None:
         self._wrapup = None
